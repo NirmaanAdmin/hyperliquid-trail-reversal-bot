@@ -171,6 +171,27 @@ LOSS_LOCK_ENABLED          = os.environ.get("LOSS_LOCK_ENABLED", "false").lower(
 LOSS_LOCK_PCT              = float(os.environ.get("LOSS_LOCK_PCT", "10.0"))
 
 # ═══════════════════════════════════════════════════════════
+#  POSITION RECONCILER — keep active_trades in sync with the exchange
+# ═══════════════════════════════════════════════════════════
+# Every RECONCILE_POLL_SEC, diff tracked active_trades against live exchange
+# positions and repair drift so orphans can't silently accumulate:
+#   • ORPHAN  (on exchange, not tracked)  -> ADOPT into tracking (best-effort:
+#       side/qty/entry from the exchange; tp/sl left None for Pine to re-drive)
+#   • GHOST   (tracked, not on exchange)  -> CLEAR stale tracking
+#   • QTY DRIFT (both present, differ)    -> logged for visibility (not auto-fixed)
+# A grace window (RECONCILE_GRACE_SEC) avoids acting on positions mid-open or
+# mid-close. Skips entirely during profit-lock cooldown (post-lock sweep is
+# still settling) and in paper mode. LIVE only.
+RECONCILER_ENABLED     = os.environ.get("RECONCILER_ENABLED", "true").lower() == "true"
+RECONCILE_POLL_SEC     = int(os.environ.get("RECONCILE_POLL_SEC", "30"))
+RECONCILE_GRACE_SEC    = int(os.environ.get("RECONCILE_GRACE_SEC", "20"))
+RECONCILE_ADOPT        = os.environ.get("RECONCILE_ADOPT", "true").lower() == "true"
+RECONCILE_CLEAR_GHOSTS = os.environ.get("RECONCILE_CLEAR_GHOSTS", "true").lower() == "true"
+
+_orphan_first_seen = {}   # coin -> epoch first observed as an orphan (grace timer)
+_reconcile_last = {"at": None, "adopted": [], "cleared": [], "qty_drift": [], "checked": 0}
+
+# ═══════════════════════════════════════════════════════════
 #  DAILY PROFIT CAP — hard stop after N% cumulative locked
 # ═══════════════════════════════════════════════════════════
 DAILY_CAP_ENABLED          = os.environ.get("DAILY_CAP_ENABLED", "true").lower() == "true"
@@ -714,6 +735,92 @@ def baseline_worker():
             log.error(f"baseline worker error: {e}", exc_info=True)
 
 
+# ═══════════════════════════════════════════════════════════
+#  RECONCILER  (LIVE only)
+# ═══════════════════════════════════════════════════════════
+def reconcile_once():
+    """One reconciliation pass: diff active_trades vs the live exchange and
+    repair drift. Returns a summary dict. No-op in paper mode or if the
+    position fetch fails (never acts blind)."""
+    global _reconcile_last
+    summary = {"at": datetime.now(timezone.utc).isoformat(),
+               "adopted": [], "cleared": [], "qty_drift": [], "checked": 0}
+    if PAPER_MODE:
+        return summary
+    poss = client.positions_live()
+    if poss is None:
+        summary["error"] = "position fetch failed"
+        _reconcile_last = summary
+        return summary
+    now = time.time()
+    ex = {p["coin"]: p for p in poss if p.get("coin") and float(p.get("qty") or 0) > 0}
+    summary["checked"] = len(ex)
+    tracked = set(active_trades.keys())
+    ex_coins = set(ex.keys())
+
+    # ── ORPHANS: on exchange, not tracked → adopt (after grace) ──
+    for coin in ex_coins - tracked:
+        first = _orphan_first_seen.setdefault(coin, now)
+        if not RECONCILE_ADOPT:
+            log.warning(f"🔭 RECONCILE: orphan {coin} on exchange, not tracked (adopt disabled)")
+            continue
+        if now - first < RECONCILE_GRACE_SEC:
+            continue  # within grace — may be a position the worker is mid-opening
+        p = ex[coin]
+        set_active_trade(coin, side=p["side"], qty=p["qty"],
+                         entry_price=(p.get("entry") or 0), order_id="reconciled",
+                         tp_price=None, sl_price=None,
+                         leverage=(p.get("leverage") or DEFAULT_LEVERAGE), margin_ccy="USDC")
+        _orphan_first_seen.pop(coin, None)
+        summary["adopted"].append(coin)
+        log.warning(f"🔭 RECONCILE: ADOPTED orphan {coin} {p['side']} {p['qty']} @ {p.get('entry')} "
+                    f"— now under management")
+
+    # forget grace timers for coins no longer orphaned
+    for coin in list(_orphan_first_seen.keys()):
+        if coin not in (ex_coins - tracked):
+            _orphan_first_seen.pop(coin, None)
+
+    # ── GHOSTS: tracked, not on exchange → clear (after grace) ──
+    if RECONCILE_CLEAR_GHOSTS:
+        for coin in tracked - ex_coins:
+            t = active_trades.get(coin) or {}
+            age = now - float(t.get("entry_time", 0) or 0)
+            if age < RECONCILE_GRACE_SEC:
+                continue  # freshly opened — exchange state may just be lagging
+            clear_active_trade(coin, "reconcile: gone from exchange")
+            summary["cleared"].append(coin)
+            log.warning(f"🔭 RECONCILE: CLEARED ghost {coin} — tracked but not on exchange")
+
+    # ── QTY DRIFT: both present, sizes differ → log only ──
+    for coin in tracked & ex_coins:
+        t = active_trades.get(coin) or {}
+        tq = float(t.get("qty", 0) or 0)
+        eq = float(ex[coin].get("qty", 0) or 0)
+        if tq > 0 and abs(tq - eq) / tq > 0.05:
+            summary["qty_drift"].append({"coin": coin, "tracked": tq, "exchange": eq})
+            log.warning(f"🔭 RECONCILE: qty drift {coin} tracked={tq} exchange={eq} (not auto-fixed)")
+
+    _reconcile_last = summary
+    return summary
+
+
+def reconcile_worker():
+    log.info(f"🔭 Reconciler started — enabled={RECONCILER_ENABLED}, poll={RECONCILE_POLL_SEC}s, "
+             f"grace={RECONCILE_GRACE_SEC}s, adopt={RECONCILE_ADOPT}, "
+             f"clear_ghosts={RECONCILE_CLEAR_GHOSTS}")
+    while True:
+        try:
+            time.sleep(RECONCILE_POLL_SEC)
+            if not RECONCILER_ENABLED or PAPER_MODE:
+                continue
+            if in_profit_lock_cooldown():
+                continue  # post-lock sweep still settling — don't adopt closing positions
+            reconcile_once()
+        except Exception as e:
+            log.error(f"reconcile_worker error: {e}", exc_info=True)
+
+
 def log_trade_event(symbol, action, alert_type, result, reason=""):
     trade_log.append({
         "time": datetime.now().strftime("%H:%M:%S"),
@@ -1197,6 +1304,12 @@ def status():
             "ist_date": str(_daily_counter_date) if _daily_counter_date else None,
             "ist_now": datetime.now(IST_TZ).isoformat(),
         },
+        "reconciler": {
+            "enabled": RECONCILER_ENABLED,
+            "poll_sec": RECONCILE_POLL_SEC,
+            "adopt": RECONCILE_ADOPT,
+            "last_pass": _reconcile_last,
+        },
         "time": datetime.now().isoformat()
     })
 
@@ -1533,6 +1646,35 @@ def baseline_reset():
     return jsonify({"status": "reset"}), 200
 
 
+@app.route("/reconcile/status", methods=["GET"])
+def reconcile_status():
+    """Read-only: config, last pass summary, and current live drift (orphans /
+    ghosts) computed fresh without acting. No auth needed."""
+    info = {"enabled": RECONCILER_ENABLED, "poll_sec": RECONCILE_POLL_SEC,
+            "grace_sec": RECONCILE_GRACE_SEC, "adopt": RECONCILE_ADOPT,
+            "clear_ghosts": RECONCILE_CLEAR_GHOSTS, "last_pass": _reconcile_last}
+    if not PAPER_MODE:
+        poss = client.positions_live()
+        if poss is not None:
+            ex = {p["coin"] for p in poss if p.get("coin") and float(p.get("qty") or 0) > 0}
+            tracked = set(active_trades.keys())
+            info["current_orphans"] = sorted(ex - tracked)
+            info["current_ghosts"] = sorted(tracked - ex)
+            info["in_sync"] = (ex == tracked)
+        else:
+            info["error"] = "position fetch failed"
+    return jsonify(info), 200
+
+
+@app.route("/reconcile/run", methods=["POST", "GET"])
+def reconcile_run():
+    """Force an immediate reconciliation pass (adopts orphans / clears ghosts
+    per config). Requires ?secret=... ."""
+    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
+    return jsonify({"status": "ok", "result": reconcile_once()}), 200
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "mode": "paper" if PAPER_MODE else "live",
@@ -1567,6 +1709,9 @@ load_target_state()
 log.info(f"🎯 Target initialized — enabled={TARGET_ENABLED}, "
          f"value={_target_value} USDC, hit={_target_hit}, poll={TARGET_POLL_SEC}s")
 threading.Thread(target=target_worker, daemon=True).start()
+
+# Start the position reconciler (self-gates on RECONCILER_ENABLED + live mode).
+threading.Thread(target=reconcile_worker, daemon=True).start()
 
 # Start the async signal worker (drains the webhook queue serially).
 if ASYNC_QUEUE_ENABLED:
