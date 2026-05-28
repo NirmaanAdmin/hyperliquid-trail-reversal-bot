@@ -441,6 +441,40 @@ def daily_cap_active():
     return DAILY_CAP_ENABLED and _daily_paused
 
 
+def _sweep_residual_positions(max_passes=2):
+    """LIVE-only: ask Hyperliquid for ANY open position and market-close it,
+    whether or not the bot was tracking it. This catches two failure modes a
+    tracked-only close misses: (1) positions orphaned by earlier state drift,
+    and (2) tracked closes that silently errored. Returns the residual count
+    after sweeping: 0 = confirmed flat, None = couldn't verify (fetch failed)."""
+    if PAPER_MODE:
+        return 0
+    last_seen = None
+    for _ in range(max_passes):
+        poss = client.positions_live()
+        if poss is None:
+            log.warning("⚠️ Post-lock sweep: position fetch failed — cannot verify flat")
+            return None
+        residual = [p for p in poss if p.get("coin") and float(p.get("qty") or 0) > 0]
+        if not residual:
+            log.info("✅ Post-lock sweep: no residual positions found")
+            return 0
+        last_seen = len(residual)
+        names = ", ".join(p["coin"] for p in residual)
+        log.warning(f"🧹 Post-lock sweep: {len(residual)} residual position(s) — force-closing: {names}")
+        for p in residual:
+            try:
+                res = client.close_market(p["coin"], sz=None)  # full close, direction inferred
+                if isinstance(res, dict) and res.get("status") == "error":
+                    log.warning(f"⚠️ Sweep close failed for {p['coin']}: {res.get('message','')}")
+                else:
+                    log.info(f"🔻 Swept residual: {p['coin']} ({p['qty']})")
+            except Exception as e:
+                log.error(f"❌ Sweep close exception for {p['coin']}: {e}", exc_info=True)
+        time.sleep(1)  # let fills settle before re-checking
+    return last_seen
+
+
 def close_all_positions(trigger_reason="profit lock", trigger_pct=None):
     """Close every position in active_trades via market order, clear state,
     and activate the post-lock cooldown. Bumps the daily counter if trigger_pct
@@ -471,11 +505,21 @@ def close_all_positions(trigger_reason="profit lock", trigger_pct=None):
             cancel_native_sl(coin)
         except Exception:
             pass
+    # Post-lock sweep — flatten ANY residual exchange position (orphans + any
+    # tracked close that silently failed) so "lock complete" actually means flat.
+    residual = _sweep_residual_positions()
     active_trades.clear()
     _save_active_trades()
     _profit_lock_until = time.time() + COOLDOWN_AFTER_LOCK_SEC
     cooldown_end = datetime.fromtimestamp(_profit_lock_until).strftime("%H:%M:%S")
-    log.info(f"✅ LOCK complete — all positions closed, cooldown until {cooldown_end}")
+    if residual == 0:
+        log.info(f"✅ LOCK complete — all positions closed (swept flat), cooldown until {cooldown_end}")
+    elif residual is None:
+        log.warning(f"⚠️ LOCK complete — closes sent but sweep could NOT verify flat; "
+                    f"CHECK EXCHANGE MANUALLY. cooldown until {cooldown_end}")
+    else:
+        log.warning(f"⚠️ LOCK complete — {residual} position(s) STILL OPEN after sweep; "
+                    f"CHECK EXCHANGE MANUALLY. cooldown until {cooldown_end}")
     if trigger_pct is not None:
         _bump_daily_counter(trigger_pct)
 
@@ -1220,6 +1264,30 @@ def loss_lock_check():
         "would_trigger": (pct is not None and LOSS_LOCK_ENABLED and pct <= -LOSS_LOCK_PCT),
         "in_cooldown": in_profit_lock_cooldown(),
         "cooldown_remaining_sec": cooldown_remaining_sec(),
+    })
+
+@app.route("/flatten", methods=["POST", "GET"])
+def flatten():
+    """Force-close EVERY open position on the exchange — including orphans the
+    bot isn't tracking — then clear tracking. Use this when /status shows
+    positions:0 but the exchange still has live positions (orphaned state).
+    Unlike /profit-lock/force (which only closes active_trades), this sweeps
+    the exchange directly. Requires ?secret=... . Does NOT set a cooldown."""
+    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
+    before = client.positions_live()
+    before_n = len(before) if before is not None else None
+    residual = _sweep_residual_positions()
+    active_trades.clear()
+    _save_active_trades()
+    log.info(f"🧹 /flatten invoked — exchange positions before={before_n}, residual_after={residual}")
+    return jsonify({
+        "status": "flattened" if residual == 0 else "incomplete",
+        "positions_before": before_n,
+        "residual_after": residual,
+        "note": ("exchange confirmed flat" if residual == 0 else
+                 "could not verify flat — check exchange" if residual is None else
+                 f"{residual} still open — retry or close manually"),
     })
 
 @app.route("/daily-cap/reset", methods=["POST", "GET"])
