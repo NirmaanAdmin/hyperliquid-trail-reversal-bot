@@ -159,6 +159,18 @@ COOLDOWN_AFTER_LOCK_SEC    = int(os.environ.get("PROFIT_LOCK_COOLDOWN_SEC", "300
 _profit_lock_until = 0.0   # epoch timestamp; webhooks restricted until this
 
 # ═══════════════════════════════════════════════════════════
+#  AUTO LOSS-LOCK — close all positions when net ROE ≤ −threshold
+# ═══════════════════════════════════════════════════════════
+# Mirror image of profit-lock: a basket-level drawdown circuit breaker. When
+# the combined net ROE across all open positions falls to −LOSS_LOCK_PCT, the
+# monitor market-closes everything and enters the SAME cooldown profit-lock
+# uses (COOLDOWN_AFTER_LOCK_SEC). It does NOT touch the daily-cap counter —
+# that tracks cumulative *profit* locked, so a loss must not subtract from it.
+# Off by default; enable via LOSS_LOCK_ENABLED=true and set LOSS_LOCK_PCT.
+LOSS_LOCK_ENABLED          = os.environ.get("LOSS_LOCK_ENABLED", "false").lower() == "true"
+LOSS_LOCK_PCT              = float(os.environ.get("LOSS_LOCK_PCT", "10.0"))
+
+# ═══════════════════════════════════════════════════════════
 #  DAILY PROFIT CAP — hard stop after N% cumulative locked
 # ═══════════════════════════════════════════════════════════
 DAILY_CAP_ENABLED          = os.environ.get("DAILY_CAP_ENABLED", "true").lower() == "true"
@@ -435,7 +447,7 @@ def close_all_positions(trigger_reason="profit lock", trigger_pct=None):
     is provided."""
     global _profit_lock_until
     snapshot = list(active_trades.items())
-    log.info(f"🔒 PROFIT LOCK triggered ({trigger_reason}) — closing {len(snapshot)} positions")
+    log.info(f"🔒 LOCK triggered ({trigger_reason}) — closing {len(snapshot)} positions")
     mids = client.all_mids() if PAPER_MODE else {}
     for coin, trade in snapshot:
         try:
@@ -463,18 +475,20 @@ def close_all_positions(trigger_reason="profit lock", trigger_pct=None):
     _save_active_trades()
     _profit_lock_until = time.time() + COOLDOWN_AFTER_LOCK_SEC
     cooldown_end = datetime.fromtimestamp(_profit_lock_until).strftime("%H:%M:%S")
-    log.info(f"✅ PROFIT LOCK complete — all positions closed, cooldown until {cooldown_end}")
+    log.info(f"✅ LOCK complete — all positions closed, cooldown until {cooldown_end}")
     if trigger_pct is not None:
         _bump_daily_counter(trigger_pct)
 
 
 def profit_lock_worker():
-    log.info(f"🎯 Profit-lock monitor started — threshold={PROFIT_LOCK_PCT}%, "
-             f"poll={POLL_INTERVAL_SEC}s, cooldown={COOLDOWN_AFTER_LOCK_SEC}s")
+    log.info(f"🎯 Profit/loss-lock monitor started — profit≥{PROFIT_LOCK_PCT}% "
+             f"(enabled={PROFIT_LOCK_ENABLED}), loss≤-{LOSS_LOCK_PCT}% "
+             f"(enabled={LOSS_LOCK_ENABLED}), poll={POLL_INTERVAL_SEC}s, "
+             f"cooldown={COOLDOWN_AFTER_LOCK_SEC}s")
     while True:
         try:
             time.sleep(POLL_INTERVAL_SEC)
-            if not PROFIT_LOCK_ENABLED:
+            if not (PROFIT_LOCK_ENABLED or LOSS_LOCK_ENABLED):
                 continue
             if time.time() < _profit_lock_until:
                 continue
@@ -482,17 +496,23 @@ def profit_lock_worker():
                 continue
             pnl, margin, pct = compute_net_roe()
             if pct is None:
-                log.debug("profit-lock: price/state unavailable this cycle")
+                log.debug("profit/loss-lock: price/state unavailable this cycle")
                 continue
             log.info(f"🎯 net_roe check: pnl={pnl:.2f} margin={margin:.2f} "
-                     f"net={pct:.2f}% (threshold={PROFIT_LOCK_PCT}%) "
+                     f"net={pct:.2f}% (profit≥{PROFIT_LOCK_PCT}% / loss≤-{LOSS_LOCK_PCT}%) "
                      f"positions={len(active_trades)}")
-            if pct >= PROFIT_LOCK_PCT:
+            if PROFIT_LOCK_ENABLED and pct >= PROFIT_LOCK_PCT:
                 close_all_positions(
                     trigger_reason=f"net ROE {pct:.2f}% ≥ {PROFIT_LOCK_PCT}%",
                     trigger_pct=pct)
+            elif LOSS_LOCK_ENABLED and pct <= -LOSS_LOCK_PCT:
+                # Loss does NOT feed the daily PROFIT cap (trigger_pct=None),
+                # but it shares the same cooldown set by close_all_positions.
+                close_all_positions(
+                    trigger_reason=f"net ROE {pct:.2f}% ≤ -{LOSS_LOCK_PCT}% (loss lock)",
+                    trigger_pct=None)
         except Exception as e:
-            log.error(f"profit-lock worker error: {e}", exc_info=True)
+            log.error(f"profit/loss-lock worker error: {e}", exc_info=True)
 
 
 def in_profit_lock_cooldown():
@@ -1117,6 +1137,13 @@ def status():
             "in_cooldown": in_profit_lock_cooldown(),
             "cooldown_remaining_sec": cooldown_remaining_sec(),
         },
+        "loss_lock": {
+            "enabled": LOSS_LOCK_ENABLED,
+            "threshold_pct": LOSS_LOCK_PCT,
+            "trigger_at_net_pct": -LOSS_LOCK_PCT,
+            "current_net_pct": pct_str,
+            "would_trigger": (pct is not None and LOSS_LOCK_ENABLED and pct <= -LOSS_LOCK_PCT),
+        },
         "daily_cap": {
             "enabled": DAILY_CAP_ENABLED,
             "cap_pct": DAILY_CAP_PCT,
@@ -1176,6 +1203,24 @@ def profit_lock_force():
                     "cooldown_remaining_sec": cooldown_remaining_sec(),
                     "daily_cumulative_pct": _daily_locked_pct_sum,
                     "daily_paused": _daily_paused})
+
+@app.route("/loss-lock/check", methods=["GET"])
+def loss_lock_check():
+    """Read-only view of the loss-lock drawdown stop. Does not trigger anything.
+    For a manual close-all on a loss, use /profit-lock/force (it closes every
+    position regardless of P&L direction)."""
+    pnl, margin, pct = compute_net_roe()
+    return jsonify({
+        "enabled": LOSS_LOCK_ENABLED,
+        "threshold_pct": LOSS_LOCK_PCT,
+        "trigger_at_net_pct": -LOSS_LOCK_PCT,
+        "current_net_pct": pct,
+        "net_pnl_usdc": pnl,
+        "total_margin_usdc": margin,
+        "would_trigger": (pct is not None and LOSS_LOCK_ENABLED and pct <= -LOSS_LOCK_PCT),
+        "in_cooldown": in_profit_lock_cooldown(),
+        "cooldown_remaining_sec": cooldown_remaining_sec(),
+    })
 
 @app.route("/daily-cap/reset", methods=["POST", "GET"])
 def daily_cap_reset():
