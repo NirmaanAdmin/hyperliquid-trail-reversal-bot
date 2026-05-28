@@ -472,7 +472,7 @@ def _sweep_residual_positions(max_passes=2):
         return 0
     last_seen = None
     for _ in range(max_passes):
-        poss = client.positions_live()
+        poss = client.positions_live(force=True)  # bypass TTL cache — must be fresh
         if poss is None:
             log.warning("⚠️ Post-lock sweep: position fetch failed — cannot verify flat")
             return None

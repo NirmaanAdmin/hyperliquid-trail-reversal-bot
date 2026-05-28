@@ -37,13 +37,19 @@ log = logging.getLogger("bot.hyperliquid")
 
 class HyperliquidFutures:
     def __init__(self, account_address, secret_key, network="mainnet",
-                 cross_margin=True, slippage=0.01, state_ttl=2.0):
+                 cross_margin=True, slippage=0.01, state_ttl=2.0,
+                 stale_max=60.0, info_retries=3, info_backoff=0.4):
         self.account_address = (account_address or "").strip()
         self.secret_key = (secret_key or "").strip()
         self.network = (network or "mainnet").strip().lower()
         self.cross_margin = bool(cross_margin)
         self.slippage = float(slippage)
         self.state_ttl = float(state_ttl)
+        # On a failed live state fetch (e.g. 429), serve the last good snapshot
+        # if it's no older than this many seconds, rather than returning None.
+        self.stale_max = float(stale_max)
+        self.info_retries = int(info_retries)     # total attempts for info calls
+        self.info_backoff = float(info_backoff)   # base backoff seconds (exp)
 
         self._lock = threading.Lock()
         self._info = None
@@ -100,9 +106,36 @@ class HyperliquidFutures:
         return self._exchange
 
     # ─── Meta (szDecimals / tick sizes) ────────────────────────────────
+    @staticmethod
+    def _is_retryable(err):
+        """True for transient info-endpoint failures worth retrying: HTTP 429
+        (rate limit) and 5xx/timeout/connection blips."""
+        s = str(err)
+        return any(tok in s for tok in (
+            "429", "Too Many Requests", "500", "502", "503", "504",
+            "timeout", "timed out", "Connection", "Max retries", "Temporarily"))
+
+    def _retry_info(self, fn, what):
+        """Call an info-endpoint fn with exponential backoff on transient errors.
+        Raises the last exception if all attempts fail."""
+        last = None
+        for i in range(max(1, self.info_retries)):
+            try:
+                return fn()
+            except Exception as e:
+                last = e
+                if self._is_retryable(e) and i < self.info_retries - 1:
+                    delay = self.info_backoff * (2 ** i)
+                    log.warning(f"{what}: transient error, retry {i+1}/{self.info_retries-1} "
+                                f"in {delay:.1f}s")
+                    time.sleep(delay)
+                    continue
+                raise
+        raise last
+
     def load_meta(self):
         try:
-            meta = self.info().meta()
+            meta = self._retry_info(lambda: self.info().meta(), "meta")
             universe = meta.get("universe", []) if isinstance(meta, dict) else []
             for a in universe:
                 name = a.get("name")
@@ -158,7 +191,7 @@ class HyperliquidFutures:
         """{coin: price(float)} mid-prices for every actively traded perp.
         Public endpoint — works without a private key (used by PAPER_MODE)."""
         try:
-            raw = self.info().all_mids()
+            raw = self._retry_info(lambda: self.info().all_mids(), "all_mids")
             out = {}
             if isinstance(raw, dict):
                 for k, v in raw.items():
@@ -176,18 +209,26 @@ class HyperliquidFutures:
 
     # ─── Account state (live mode) ─────────────────────────────────────
     def clearinghouse(self, force=False):
-        """Cached user_state (clearinghouseState) for the main account."""
+        """Cached user_state (clearinghouseState) for the main account.
+        On a failed refresh (e.g. 429 rate limit), serves the last good snapshot
+        if it's no older than stale_max, instead of returning None — this keeps
+        the reconciler/locks/sweep from going blind during transient throttling."""
         now = time.time()
         if (not force) and self._state is not None and (now - self._state_ts) < self.state_ttl:
             return self._state
         if not self.account_address:
             return None
         try:
-            st = self.info().user_state(self.account_address)
+            st = self._retry_info(
+                lambda: self.info().user_state(self.account_address), "user_state")
             self._state = st
             self._state_ts = now
             return st
         except Exception as e:
+            age = now - self._state_ts
+            if self._state is not None and age <= self.stale_max:
+                log.warning(f"user_state failed ({e}); serving cached snapshot {age:.0f}s old")
+                return self._state
             log.warning(f"user_state failed: {e}")
             return None
 
@@ -213,11 +254,13 @@ class HyperliquidFutures:
         except (TypeError, ValueError):
             return None
 
-    def positions_live(self):
+    def positions_live(self, force=False):
         """Normalised open positions from user_state. Each item:
         {coin, side, qty, entry, unrealized, margin_used, position_value, leverage}.
-        Returns [] when flat, or None if the state fetch failed."""
-        st = self.clearinghouse()
+        Returns [] when flat, or None if the state fetch failed.
+        Pass force=True to bypass the TTL cache (used by the post-lock sweep,
+        which re-reads right after closing and must not see a stale snapshot)."""
+        st = self.clearinghouse(force=force)
         if not isinstance(st, dict):
             return None
         out = []
