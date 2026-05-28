@@ -2,6 +2,7 @@ import os
 import json
 import math
 import time
+import queue
 import logging
 import threading
 from datetime import datetime, timezone, timedelta
@@ -53,6 +54,21 @@ except Exception:
 # Native SL (real HL trigger order). OFF by default — Pine drives SL via
 # reverse/close webhooks, same as the original deployment.
 NATIVE_SL_ENABLED = os.environ.get("NATIVE_SL_ENABLED", "false").lower() == "true"
+
+# Async webhook processing — the /webhook route returns 200 instantly and
+# enqueues the signal; a single background worker drains the queue serially.
+# This stops TradingView from timing out during bursts (its webhooks are not
+# retried on timeout) and keeps the close→reopen of a reverse from being cut
+# off mid-sequence. Serial (one worker) is deliberate: active_trades is shared
+# mutable state, so processing in order avoids races and keeps one source of
+# truth — same reason the gunicorn worker count is pinned to 1.
+ASYNC_QUEUE_ENABLED = os.environ.get("ASYNC_QUEUE_ENABLED", "true").lower() == "true"
+# Skip ENTRY jobs that have waited longer than this in the queue (price has
+# moved too far to act on the original signal). Books/reverses/closes are
+# always processed — you want exposure-reducing actions done even if late.
+# 0 disables the staleness guard.
+MAX_JOB_AGE_SEC = float(os.environ.get("MAX_JOB_AGE_SEC", "15"))
+_signal_queue = queue.Queue()
 
 app = Flask(__name__)
 client = HyperliquidFutures(
@@ -753,13 +769,63 @@ def cancel_native_sl(coin):
 # ═══════════════════════════════════════════════════════════
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    """Thin, fast handler: validate cheaply and ENQUEUE, then return 200 at
+    once so TradingView never waits on the (slow, signed) Hyperliquid order.
+    All real work happens in signal_worker. Falls back to synchronous
+    processing if ASYNC_QUEUE_ENABLED is off."""
     try:
         data = request.json or json.loads(request.data.decode("utf-8"))
-        log.info(f"📩 Webhook: {json.dumps(data)}")
+    except Exception:
+        return jsonify({"error": "bad json"}), 400
 
-        if WEBHOOK_SECRET and data.get("secret") != WEBHOOK_SECRET:
-            return jsonify({"error": "unauthorized"}), 401
+    log.info(f"📩 Webhook: {json.dumps(data)}")
 
+    if WEBHOOK_SECRET and data.get("secret") != WEBHOOK_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
+    if data.get("action", "").lower() not in ("buy", "sell"):
+        return jsonify({"status": "rejected", "reason": "invalid action"}), 200
+    if not data.get("symbol", ""):
+        return jsonify({"status": "rejected", "reason": "missing symbol"}), 200
+
+    if ASYNC_QUEUE_ENABLED:
+        _signal_queue.put((data, time.time()))
+        depth = _signal_queue.qsize()
+        log.info(f"📥 Queued {data.get('type', 'entry')} {data.get('symbol')} (queue depth={depth})")
+        return jsonify({"status": "queued", "depth": depth}), 200
+
+    # Synchronous fallback (runs in this request's context, so jsonify is fine)
+    process_signal(data, time.time())
+    return jsonify({"status": "processed"}), 200
+
+
+def signal_worker():
+    """Background thread: drains the signal queue one job at a time. Serial by
+    design — keeps active_trades coherent and avoids races. Runs each job in an
+    app context so the reused process_signal() body can call jsonify() (its
+    return values are discarded here)."""
+    log.info(f"⚙️ Async signal worker started — enabled={ASYNC_QUEUE_ENABLED}, "
+             f"max_job_age={MAX_JOB_AGE_SEC}s")
+    while True:
+        try:
+            data, enqueued_at = _signal_queue.get()
+            try:
+                with app.app_context():
+                    process_signal(data, enqueued_at)
+            except Exception as e:
+                log.error(f"signal_worker process error: {e}", exc_info=True)
+            finally:
+                _signal_queue.task_done()
+        except Exception as e:
+            log.error(f"signal_worker loop error: {e}", exc_info=True)
+            time.sleep(0.5)
+
+
+def process_signal(data, enqueued_at):
+    """The actual decision logic (gates + entry/book/reverse/close). Pulled out
+    of the route so it can run in the background worker. Its jsonify() returns
+    are only meaningful in the synchronous fallback; in the worker they're
+    discarded. All real outcomes are logged via log_trade_event / log."""
+    try:
         action = data.get("action", "").lower()
         raw_symbol = data.get("symbol", "")
         symbol = coin_from_symbol(raw_symbol)           # HL coin name
@@ -776,6 +842,15 @@ def webhook():
             return jsonify({"status": "rejected", "reason": "invalid action"}), 200
         if not symbol:
             return jsonify({"status": "rejected", "reason": "missing symbol"}), 200
+
+        # ─── STALENESS GUARD (entries only) ───────────────────
+        # If a burst backed up the queue, an old ENTRY is acting on a price
+        # that has since moved — skip it. Books/reverses/closes still run.
+        age = time.time() - enqueued_at
+        if MAX_JOB_AGE_SEC > 0 and age > MAX_JOB_AGE_SEC and alert_type == "entry":
+            log.info(f"⏱ STALE entry skipped: {symbol} ({age:.1f}s old > {MAX_JOB_AGE_SEC}s)")
+            log_trade_event(symbol, action, "entry", "STALE", f"{age:.1f}s old")
+            return jsonify({"status": "stale", "age_sec": round(age, 1)}), 200
 
         leverage = clamp_leverage(symbol, leverage)
 
@@ -1025,6 +1100,8 @@ def status():
         "mode": "paper" if PAPER_MODE else "live",
         "network": HL_NETWORK,
         "exchange_ready": client.ready(),
+        "queue_depth": _signal_queue.qsize(),
+        "async_enabled": ASYNC_QUEUE_ENABLED,
         "account_value_usdc": get_current_value_usdt(),
         "wallet_usdc": get_wallet_usdt(),
         "paper_realized_usdc": round(_paper_realized, 4) if PAPER_MODE else None,
@@ -1377,6 +1454,13 @@ load_target_state()
 log.info(f"🎯 Target initialized — enabled={TARGET_ENABLED}, "
          f"value={_target_value} USDC, hit={_target_hit}, poll={TARGET_POLL_SEC}s")
 threading.Thread(target=target_worker, daemon=True).start()
+
+# Start the async signal worker (drains the webhook queue serially).
+if ASYNC_QUEUE_ENABLED:
+    threading.Thread(target=signal_worker, daemon=True).start()
+    log.info(f"⚙️ Async webhook queue ENABLED — max_job_age={MAX_JOB_AGE_SEC}s")
+else:
+    log.info("⚙️ Async webhook queue DISABLED — processing synchronously")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))

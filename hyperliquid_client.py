@@ -59,6 +59,10 @@ class HyperliquidFutures:
         self._state = None
         self._state_ts = 0.0
 
+        # per-coin leverage cache — avoids a redundant signed update_leverage
+        # round-trip before every order when leverage hasn't changed
+        self._lev_cache = {}  # coin -> int leverage last successfully set
+
     # ─── URLs / lazy SDK construction ──────────────────────────────────
     def _base_url(self):
         return (constants.TESTNET_API_URL if self.network in ("testnet", "test")
@@ -244,11 +248,22 @@ class HyperliquidFutures:
         return out
 
     # ─── Trading ───────────────────────────────────────────────────────
-    def set_leverage(self, coin, leverage):
+    def set_leverage(self, coin, leverage, force=False):
+        """Set leverage for a coin, skipping the network call if it's already
+        at the requested value (per the in-process cache). update_leverage is a
+        signed L1 action — caching it removes ~1 round-trip from every repeat
+        order on the same coin, which is the bulk of per-order latency."""
+        lev = int(leverage)
+        if not force and self._lev_cache.get(coin) == lev:
+            return {"status": "ok", "cached": True}
         try:
-            return self.exchange().update_leverage(int(leverage), coin, self.cross_margin)
+            res = self.exchange().update_leverage(lev, coin, self.cross_margin)
+            if isinstance(res, dict) and res.get("status") == "ok":
+                self._lev_cache[coin] = lev  # cache only on confirmed success
+            return res
         except Exception as e:
             log.warning(f"set_leverage {coin} {leverage}x failed (continuing): {e}")
+            self._lev_cache.pop(coin, None)  # force a retry next time
             return {"status": "error", "message": str(e)}
 
     @staticmethod
