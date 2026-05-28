@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+data/
+active_trades.json
+target_state.json
+baseline_state.json
+.DS_Store

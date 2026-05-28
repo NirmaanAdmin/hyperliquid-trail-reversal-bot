@@ -1,0 +1,42 @@
+═══════════════════════════════════════════════════════════════════════
+ Pine patch for Hyperliquid  (trail_tpsl_live.pine)
+═══════════════════════════════════════════════════════════════════════
+Your STRATEGY logic is exchange-agnostic and does NOT need rewriting.
+The server already normalises "B-BTC_USDT" → "BTC", so the existing Pine
+works unchanged. The two small edits below just make the payload native to
+Hyperliquid (bare coin names + USDC) and are optional but recommended.
+
+─── 1. Symbol: replace f_cdcx_pair() with f_coin() ───────────────────
+Old (≈ line 65):
+    f_cdcx_pair() =>
+        raw = syminfo.ticker
+        clean = str.contains(raw, ".P") ? str.replace(raw, ".P", "") : raw
+        base = str.replace(clean, "USDT", "")
+        "B-" + base + "_USDT"
+    cdcxPair = f_cdcx_pair()
+
+New:
+    f_coin() =>
+        raw = syminfo.ticker
+        clean = str.contains(raw, ".P") ? str.replace(raw, ".P", "") : raw
+        clean := str.replace(clean, "USDT", "")
+        clean := str.replace(clean, "USD", "")
+        clean
+    cdcxPair = f_coin()         // keep the var name so the rest of the file is untouched
+
+  NOTE: for coins TradingView prefixes with 1000 (e.g. 1000PEPE) Hyperliquid
+  uses a k-prefix (kPEPE). Don't fix this in Pine — set it once on the server:
+      SYMBOL_OVERRIDES={"1000PEPE":"kPEPE","1000BONK":"kBONK"}
+
+─── 2. Margin currency default (≈ line 16) ───────────────────────────
+Old:  i_margin = input.string("INR",  "Margin Currency", options=["INR","USDT"])
+New:  i_margin = input.string("USDC", "Margin Currency", options=["USDC"])
+  (cosmetic — the server forces USDC regardless; HL is USDC-margined.)
+
+─── 3. Cosmetic: kill-switch tooltip (≈ line 12) ─────────────────────
+  The tooltip text says "CoinDCX" — change to "Hyperliquid" if you like.
+  No functional impact.
+
+The webhook JSON shape (action/symbol/type/price/leverage/tp_price/sl_price/
+book_pct/reason/return_pct/secret) is unchanged — the server reads it exactly
+as before.
