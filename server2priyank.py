@@ -83,15 +83,33 @@ client = HyperliquidFutures(
 _paper_realized = 0.0
 
 
+_seen_automaps = set()   # logs each 1000->k auto-map only the first time per process
+
 def coin_from_symbol(symbol):
     """Normalise a TradingView/CoinDCX-style symbol to a Hyperliquid coin name.
-        B-BTC_USDT -> BTC | BTCUSDT.P -> BTC | BTCUSD -> BTC | ETH -> ETH
-    Honours SYMBOL_OVERRIDES first for special cases (e.g. 1000PEPE -> kPEPE)."""
+        B-BTC_USDT        -> BTC
+        BTCUSDT.P         -> BTC
+        BINANCE:BTCUSD    -> BTC
+        ETH               -> ETH
+        1000PEPEUSDT.P    -> kPEPE   (auto-mapped when HL has kPEPE)
+        B-1000BONK_USDT   -> kBONK   (auto-mapped when HL has kBONK)
+
+    Resolution order:
+      1. SYMBOL_OVERRIDES env (matched against raw input first)
+      2. Strip exchange prefix/suffix ('BINANCE:', 'B-..._USDT', '.P', USDT/USDC/PERP/USD)
+      3. SYMBOL_OVERRIDES against the stripped form (so users can write
+         {"1000PEPE":"kPEPE"} once instead of per-input-format)
+      4. Auto 1000X -> kX when HL universe has the k-variant
+      5. Return the stripped form as-is"""
     if not symbol:
         return symbol
     s = symbol.strip().upper()
+    # 1) raw-input override (most specific)
     if s in SYMBOL_OVERRIDES:
         return SYMBOL_OVERRIDES[s]
+    # 2) strip "EXCHANGE:" prefix from TradingView tickers
+    if ":" in s:
+        s = s.split(":", 1)[1]
     if s.startswith("B-") and s.endswith("_USDT"):
         s = s[2:-5]
     s = s.replace(".P", "")
@@ -99,6 +117,20 @@ def coin_from_symbol(symbol):
         if s.endswith(suf) and len(s) > len(suf):
             s = s[:-len(suf)]
             break
+    # 3) stripped-form override
+    if s in SYMBOL_OVERRIDES:
+        return SYMBOL_OVERRIDES[s]
+    # 4) auto 1000X -> kX when HL has the k-variant (and not the 1000- form itself)
+    if s.startswith("1000") and len(s) > 4:
+        candidate = "k" + s[4:]
+        try:
+            if client.has_coin(candidate) and not client.has_coin(s):
+                if s not in _seen_automaps:
+                    log.info(f"🔁 Symbol auto-mapped: {s} -> {candidate} (HL k-prefix variant)")
+                    _seen_automaps.add(s)
+                return candidate
+        except Exception as e:
+            log.debug(f"coin_from_symbol auto-map check failed for {s}: {e}")
     return s
 
 

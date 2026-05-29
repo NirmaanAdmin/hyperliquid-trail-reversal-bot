@@ -165,6 +165,13 @@ class HyperliquidFutures:
         self._ensure_meta()
         return self._sz_dec.get(coin, 4)  # 4 is a safe default for most perps
 
+    def has_coin(self, name):
+        """True if `name` is a valid perp coin on Hyperliquid (per meta)."""
+        if not name:
+            return False
+        self._ensure_meta()
+        return name in self._sz_dec
+
     def max_leverage(self, coin):
         self._ensure_meta()
         return self._max_lev.get(coin)
