@@ -192,6 +192,24 @@ _orphan_first_seen = {}   # coin -> epoch first observed as an orphan (grace tim
 _reconcile_last = {"at": None, "adopted": [], "cleared": [], "qty_drift": [], "checked": 0}
 
 # ═══════════════════════════════════════════════════════════
+#  WINNING STREAK PAUSE
+# ═══════════════════════════════════════════════════════════
+# Counts consecutive profit-locks. Each profit-lock increments; a loss-lock
+# resets to 0. When count reaches STREAK_THRESHOLD, the bot pauses (rejects
+# webhooks) for STREAK_PAUSE_SEC, then resumes — counter clears on resume.
+# Off by default; enable via STREAK_ENABLED=true. State persists across
+# restarts in STREAK_FILE (use a Railway volume for durability).
+STREAK_ENABLED   = os.environ.get("STREAK_ENABLED", "false").lower() == "true"
+STREAK_THRESHOLD = int(os.environ.get("STREAK_THRESHOLD", "3"))
+STREAK_PAUSE_SEC = int(os.environ.get("STREAK_PAUSE_SEC", "1800"))   # 30 min default
+STREAK_FILE      = os.environ.get("STREAK_FILE", "/app/data/streak_state.json")
+
+_streak_count        = 0
+_streak_pause_until  = 0.0
+_streak_last_lock_at = None
+_streak_max_ever     = 0
+
+# ═══════════════════════════════════════════════════════════
 #  DAILY PROFIT CAP — hard stop after N% cumulative locked
 # ═══════════════════════════════════════════════════════════
 DAILY_CAP_ENABLED          = os.environ.get("DAILY_CAP_ENABLED", "true").lower() == "true"
@@ -496,7 +514,93 @@ def _sweep_residual_positions(max_passes=2):
     return last_seen
 
 
-def close_all_positions(trigger_reason="profit lock", trigger_pct=None):
+# ═══════════════════════════════════════════════════════════
+#  STREAK HELPERS
+# ═══════════════════════════════════════════════════════════
+def load_streak_state():
+    global _streak_count, _streak_pause_until, _streak_last_lock_at, _streak_max_ever
+    try:
+        with open(STREAK_FILE) as f:
+            s = json.load(f)
+        _streak_count        = int(s.get("count", 0))
+        _streak_pause_until  = float(s.get("pause_until", 0.0))
+        _streak_last_lock_at = s.get("last_lock_at")
+        _streak_max_ever     = int(s.get("max_ever", 0))
+        log.info(f"📈 Streak loaded: count={_streak_count}, max_ever={_streak_max_ever}, "
+                 f"paused={_streak_pause_until > time.time()}")
+    except FileNotFoundError:
+        log.info(f"📈 No streak file at {STREAK_FILE} — starting at 0")
+    except Exception as e:
+        log.warning(f"⚠️ Streak file load failed ({e}) — starting fresh")
+
+
+def save_streak_state():
+    try:
+        os.makedirs(os.path.dirname(STREAK_FILE), exist_ok=True)
+        with open(STREAK_FILE, "w") as f:
+            json.dump({
+                "count": _streak_count,
+                "pause_until": _streak_pause_until,
+                "last_lock_at": _streak_last_lock_at,
+                "max_ever": _streak_max_ever,
+            }, f, indent=2)
+    except Exception as e:
+        log.error(f"❌ Failed to save streak state: {e}")
+
+
+def streak_pause_active():
+    return STREAK_ENABLED and time.time() < _streak_pause_until
+
+
+def streak_pause_remaining_sec():
+    return max(0, int(_streak_pause_until - time.time()))
+
+
+def _bump_streak_on_profit():
+    """Called when a profit-lock fires. Increments the consecutive-win counter
+    and, if it hits STREAK_THRESHOLD, arms the pause."""
+    global _streak_count, _streak_pause_until, _streak_last_lock_at, _streak_max_ever
+    if not STREAK_ENABLED:
+        return
+    _streak_count += 1
+    _streak_last_lock_at = datetime.now(timezone.utc).isoformat()
+    if _streak_count > _streak_max_ever:
+        _streak_max_ever = _streak_count
+    log.info(f"📈 Profit-lock streak: {_streak_count}/{STREAK_THRESHOLD}")
+    if _streak_count >= STREAK_THRESHOLD:
+        _streak_pause_until = time.time() + STREAK_PAUSE_SEC
+        until = datetime.fromtimestamp(_streak_pause_until).strftime("%H:%M:%S")
+        log.warning(f"🛑 STREAK PAUSE armed — {_streak_count} consecutive profit-locks "
+                    f"≥ threshold {STREAK_THRESHOLD}; webhooks rejected until {until} "
+                    f"(then counter resets and trading resumes)")
+    save_streak_state()
+
+
+def _reset_streak_on_loss():
+    """Called when a loss-lock fires. Breaks the winning streak."""
+    global _streak_count
+    if not STREAK_ENABLED:
+        return
+    if _streak_count > 0:
+        log.info(f"📉 Loss-lock — streak broken at {_streak_count}, resetting to 0")
+        _streak_count = 0
+        save_streak_state()
+
+
+def _maybe_resume_after_streak_pause():
+    """If a streak pause has elapsed, clear the counter so trading resumes
+    fresh. Called from the webhook gate so the transition is observable."""
+    global _streak_count, _streak_pause_until
+    if not STREAK_ENABLED:
+        return
+    if _streak_pause_until and time.time() >= _streak_pause_until and _streak_count > 0:
+        log.info(f"✅ Streak pause elapsed — resetting counter (was {_streak_count}) and resuming")
+        _streak_count = 0
+        _streak_pause_until = 0.0
+        save_streak_state()
+
+
+def close_all_positions(trigger_reason="profit lock", trigger_pct=None, lock_kind="manual"):
     """Close every position in active_trades via market order, clear state,
     and activate the post-lock cooldown. Bumps the daily counter if trigger_pct
     is provided."""
@@ -543,6 +647,11 @@ def close_all_positions(trigger_reason="profit lock", trigger_pct=None):
                     f"CHECK EXCHANGE MANUALLY. cooldown until {cooldown_end}")
     if trigger_pct is not None:
         _bump_daily_counter(trigger_pct)
+    # Streak: profit-lock increments, loss-lock resets, others no-op
+    if lock_kind == "profit":
+        _bump_streak_on_profit()
+    elif lock_kind == "loss":
+        _reset_streak_on_loss()
 
 
 def profit_lock_worker():
@@ -569,13 +678,13 @@ def profit_lock_worker():
             if PROFIT_LOCK_ENABLED and pct >= PROFIT_LOCK_PCT:
                 close_all_positions(
                     trigger_reason=f"net ROE {pct:.2f}% ≥ {PROFIT_LOCK_PCT}%",
-                    trigger_pct=pct)
+                    trigger_pct=pct, lock_kind="profit")
             elif LOSS_LOCK_ENABLED and pct <= -LOSS_LOCK_PCT:
                 # Loss does NOT feed the daily PROFIT cap (trigger_pct=None),
                 # but it shares the same cooldown set by close_all_positions.
                 close_all_positions(
                     trigger_reason=f"net ROE {pct:.2f}% ≤ -{LOSS_LOCK_PCT}% (loss lock)",
-                    trigger_pct=None)
+                    trigger_pct=None, lock_kind="loss")
         except Exception as e:
             log.error(f"profit/loss-lock worker error: {e}", exc_info=True)
 
@@ -657,7 +766,7 @@ def trigger_baseline_lock():
     close_all_positions(
         trigger_reason=f"baseline target — equity {equity_at_trigger:.2f} ≥ "
                        f"{old_baseline * (1 + BASELINE_TRIGGER_PCT/100):.2f}",
-        trigger_pct=None)
+        trigger_pct=None, lock_kind="baseline")
 
     new_baseline = old_baseline * (1 + BASELINE_ROLLOVER_PCT / 100)
     realized_this_cycle = equity_at_trigger - old_baseline
@@ -1033,6 +1142,19 @@ def process_signal(data, enqueued_at):
             return jsonify({"status": "rejected",
                             "reason": f"daily cap reached ({_daily_locked_pct_sum:.2f}% ≥ {DAILY_CAP_PCT}%)"}), 200
 
+        # ─── STREAK PAUSE GATE ────────────────────────────────
+        # Pause triggered by N consecutive profit-locks. Auto-resumes (with
+        # counter reset) once STREAK_PAUSE_SEC elapses.
+        _maybe_resume_after_streak_pause()
+        if streak_pause_active():
+            remaining = streak_pause_remaining_sec()
+            log.info(f"📈 STREAK PAUSE: rejecting {alert_type} for {symbol} — {remaining}s left "
+                     f"(streak {_streak_count}/{STREAK_THRESHOLD})")
+            log_trade_event(symbol, action, alert_type, "STREAK_PAUSE",
+                            f"{remaining}s remaining, streak={_streak_count}")
+            return jsonify({"status": "rejected",
+                            "reason": f"streak pause ({remaining}s)"}), 200
+
         # ─── PROFIT-LOCK COOLDOWN GATE ────────────────────────
         if in_profit_lock_cooldown():
             remaining = cooldown_remaining_sec()
@@ -1310,6 +1432,16 @@ def status():
             "adopt": RECONCILE_ADOPT,
             "last_pass": _reconcile_last,
         },
+        "streak": {
+            "enabled": STREAK_ENABLED,
+            "count": _streak_count,
+            "threshold": STREAK_THRESHOLD,
+            "max_ever": _streak_max_ever,
+            "paused": streak_pause_active(),
+            "pause_remaining_sec": streak_pause_remaining_sec(),
+            "pause_sec": STREAK_PAUSE_SEC,
+            "last_lock_at": _streak_last_lock_at,
+        },
         "time": datetime.now().isoformat()
     })
 
@@ -1355,7 +1487,7 @@ def profit_lock_force():
         return jsonify({"status": "no_positions", "active": 0})
     count = len(active_trades)
     pnl, margin, pct = compute_net_roe()
-    close_all_positions(trigger_reason="manual force", trigger_pct=(pct if pct is not None else 0.0))
+    close_all_positions(trigger_reason="manual force", trigger_pct=(pct if pct is not None else 0.0), lock_kind="manual")
     return jsonify({"status": "locked", "closed": count, "trigger_pct": pct,
                     "cooldown_remaining_sec": cooldown_remaining_sec(),
                     "daily_cumulative_pct": _daily_locked_pct_sum,
@@ -1675,6 +1807,42 @@ def reconcile_run():
     return jsonify({"status": "ok", "result": reconcile_once()}), 200
 
 
+@app.route("/streak/status", methods=["GET"])
+def streak_status_endpoint():
+    """Read-only view of the consecutive-profit-lock streak and any active pause."""
+    _maybe_resume_after_streak_pause()
+    return jsonify({
+        "enabled": STREAK_ENABLED,
+        "count": _streak_count,
+        "threshold": STREAK_THRESHOLD,
+        "max_ever": _streak_max_ever,
+        "paused": streak_pause_active(),
+        "pause_remaining_sec": streak_pause_remaining_sec(),
+        "pause_sec": STREAK_PAUSE_SEC,
+        "last_lock_at": _streak_last_lock_at,
+    }), 200
+
+
+@app.route("/streak/reset", methods=["POST", "GET"])
+def streak_reset():
+    """Manually clear the streak counter and lift any active streak pause.
+    Requires ?secret=... ."""
+    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
+    global _streak_count, _streak_pause_until
+    prev_count = _streak_count
+    was_paused = streak_pause_active()
+    _streak_count = 0
+    _streak_pause_until = 0.0
+    save_streak_state()
+    log.info(f"🔄 Streak manually reset (was count={prev_count}, paused={was_paused})")
+    return jsonify({
+        "status": "reset",
+        "previous_count": prev_count,
+        "was_paused": was_paused,
+    }), 200
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "mode": "paper" if PAPER_MODE else "live",
@@ -1709,6 +1877,11 @@ load_target_state()
 log.info(f"🎯 Target initialized — enabled={TARGET_ENABLED}, "
          f"value={_target_value} USDC, hit={_target_hit}, poll={TARGET_POLL_SEC}s")
 threading.Thread(target=target_worker, daemon=True).start()
+
+# Load streak state from disk (persists across redeploys if volume mounted).
+load_streak_state()
+log.info(f"📈 Streak initialized — enabled={STREAK_ENABLED}, count={_streak_count}, "
+         f"threshold={STREAK_THRESHOLD}, pause={STREAK_PAUSE_SEC}s")
 
 # Start the position reconciler (self-gates on RECONCILER_ENABLED + live mode).
 threading.Thread(target=reconcile_worker, daemon=True).start()
