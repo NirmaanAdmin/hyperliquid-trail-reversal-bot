@@ -40,6 +40,11 @@ PAPER_START_USDT = float(os.environ.get("PAPER_START_USDT", "1000"))
 
 # Position sizing (USDC margin per trade)
 FIXED_MARGIN_USDT = float(os.environ.get("FIXED_MARGIN_USDT", "0"))
+# Hard ceiling on the number of distinct coins held at once. A fresh entry on a
+# NEW coin is rejected once this many positions are already open. 0 = unlimited
+# (no behaviour change). Counts the tracker, so it works in paper and live.
+# Read at boot — change via Railway env then restart, like the other gates.
+MAX_POSITIONS = int(os.environ.get("MAX_POSITIONS", "0"))
 WALLET_USAGE_PCT  = float(os.environ.get("WALLET_USAGE_PCT", "100")) / 100
 MIN_NOTIONAL_USDT = float(os.environ.get("MIN_NOTIONAL_USDT", "10"))  # HL min order value
 
@@ -1230,6 +1235,23 @@ def process_signal(data, enqueued_at):
                 log_trade_event(symbol, action, "entry", "SKIP", f"already active ({mins}m)")
                 return jsonify({"status": "skipped", "reason": "already active"}), 200
 
+            # ─── POSITION CAP — hard ceiling on concurrent coins ───
+            # A fresh entry on a NEW coin is rejected once the bot already holds
+            # MAX_POSITIONS distinct coins. Re-entries on a tracked coin (handled
+            # just above) and reverses (1-for-1 flips on an existing coin) are NOT
+            # counted — they don't add a position. The serial signal_worker
+            # guarantees this count can't race another entry. Counts the tracker,
+            # so it's correct in PAPER_MODE too. 0 = unlimited.
+            if MAX_POSITIONS > 0 and len(active_trades) >= MAX_POSITIONS:
+                log.info(f"🧮 POSITION CAP: rejecting entry for {symbol} — "
+                         f"{len(active_trades)}/{MAX_POSITIONS} open "
+                         f"[{', '.join(active_trades.keys())}]")
+                log_trade_event(symbol, action, "entry", "POS_CAP",
+                                f"{len(active_trades)}/{MAX_POSITIONS}")
+                return jsonify({"status": "rejected",
+                                "reason": f"position cap reached "
+                                          f"({len(active_trades)}/{MAX_POSITIONS})"}), 200
+
             quantity = calc_quantity(symbol, coin_price, leverage)
             if quantity <= 0:
                 log.error(f"❌ REJECT: {symbol} — qty=0")
@@ -1433,6 +1455,11 @@ def status():
         "active_trades": active_trades,
         "native_sl_orders": native_sl_orders,
         "positions": len(active_trades),
+        "max_positions": {
+            "cap": MAX_POSITIONS,
+            "open": len(active_trades),
+            "at_cap": (MAX_POSITIONS > 0 and len(active_trades) >= MAX_POSITIONS),
+        },
         "profit_lock": {
             "enabled": PROFIT_LOCK_ENABLED,
             "threshold_pct": PROFIT_LOCK_PCT,
