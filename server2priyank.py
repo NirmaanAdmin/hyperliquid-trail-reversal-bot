@@ -60,6 +60,39 @@ except Exception:
 # reverse/close webhooks, same as the original deployment.
 NATIVE_SL_ENABLED = os.environ.get("NATIVE_SL_ENABLED", "false").lower() == "true"
 
+# ═══════════════════════════════════════════════════════════
+#  SERVER-OWNED EXIT LADDER  (SL + partial books + ratcheting trail)
+# ═══════════════════════════════════════════════════════════
+# Ported from the validated CoinDCX ladder (identical math). The server owns
+# the entire exit lifecycle off the REAL avg fill: static SL at entry∓SL_PCT,
+# books BOOK_PCT of the original size at each +TP_STEP_PCT rung up to MAX_BOOKS,
+# then trails the SL one rung behind the highest rung crossed (never loosens).
+# On an SL breach it flattens and waits (no reverse — Pine's next entry drives
+# direction). Pairs with entry-only Pine; dark by default.
+#
+# HL specifics vs CoinDCX: mark comes from client.all_mids() (the live mid feed,
+# so it CANNOT inherit CoinDCX's stale-positions-mark bug); avg+size come from
+# positions_live() in live / active_trades in paper; closes go through
+# place_market(reduce_only=True) and feed record_realized() so paper-wallet and
+# baseline accounting stay correct (a gap the CoinDCX ladder actually has).
+# Lock-free, matching this file's design — see server_exit_worker for the
+# concurrency note (reduce-only closes + side-consistency guard + reconciler).
+SERVER_EXITS_ENABLED = os.environ.get("SERVER_EXITS_ENABLED", "false").lower() == "true"
+SL_PCT               = float(os.environ.get("SL_PCT", "3.0"))        # initial stop, price %
+TP_STEP_PCT          = float(os.environ.get("TP_STEP_PCT", "4.0"))   # rung spacing, price %
+BOOK_PCT             = float(os.environ.get("BOOK_PCT", "33.0"))     # % of ORIGINAL per book
+MAX_BOOKS            = int(os.environ.get("MAX_BOOKS", "2"))         # books before pure trail
+EXIT_POLL_SEC        = int(os.environ.get("EXIT_POLL_SEC", "5"))     # ladder poll cadence
+# Per-cycle heartbeat: when true, every armed coin logs mark/avg/prof%/k/books/sl
+# each poll so the ladder's view is observable live instead of inferred.
+LADDER_VERBOSE       = os.environ.get("LADDER_VERBOSE", "false").lower() == "true"
+
+# Ladder runtime state (read by /status)
+_server_exit_closes        = 0
+_server_exit_last_check_at = None
+_server_exit_last_error    = None
+
+
 # Async webhook processing — the /webhook route returns 200 instantly and
 # enqueues the signal; a single background worker drains the queue serially.
 # This stops TradingView from timing out during bursts (its webhooks are not
@@ -1082,6 +1115,289 @@ def cancel_native_sl(coin):
 
 
 # ═══════════════════════════════════════════════════════════
+#  SERVER-OWNED EXIT LADDER  (SL + partial books + ratcheting trail)
+#  Ported verbatim-in-math from the validated CoinDCX ladder.
+# ═══════════════════════════════════════════════════════════
+def _sl_level(side, entry):
+    """Static initial SL price: entry ∓ SL_PCT. Long stop below, short above."""
+    if not entry or entry <= 0:
+        return None
+    if side == "buy":
+        return entry * (1.0 - SL_PCT / 100.0)
+    return entry * (1.0 + SL_PCT / 100.0)
+
+
+def _sl_breached(side, mark, sl):
+    """Long breaches at/below the stop; short breaches at/above it."""
+    if not sl or sl <= 0 or not mark or mark <= 0:
+        return False
+    return mark <= sl if side == "buy" else mark >= sl
+
+
+def _rungs_crossed(side, mark, avg):
+    """How many whole TP_STEP_PCT rungs the mark has moved INTO PROFIT off avg.
+    Long: price above avg. Short: price below avg. 0 if not yet in profit."""
+    if avg <= 0 or mark <= 0:
+        return 0
+    prof = (mark - avg) / avg if side == "buy" else (avg - mark) / avg
+    if prof <= 0:
+        return 0
+    return int(math.floor(prof / (TP_STEP_PCT / 100.0)))
+
+
+def _ladder_sl_target(side, avg, k):
+    """SL price implied by k rungs crossed:
+        k <= 0 → initial stop, avg ∓ SL_PCT
+        k == 1 → breakeven (avg)
+        k >= 2 → one rung behind the highest crossed: avg ± TP_STEP_PCT*(k-1)"""
+    if k <= 0:
+        return _sl_level(side, avg)
+    step = TP_STEP_PCT / 100.0
+    if side == "buy":
+        return avg * (1.0 + step * (k - 1))
+    return avg * (1.0 - step * (k - 1))
+
+
+def _ratchet_sl(side, cur_sl, target):
+    """SL only ever moves toward profit — up for long, down for short. Never loosens."""
+    if cur_sl is None:
+        return target
+    if target is None:
+        return cur_sl
+    return max(cur_sl, target) if side == "buy" else min(cur_sl, target)
+
+
+def _ladder_fetch():
+    """Returns (pos_map, marks) for the ladder, mode-aware (mirrors compute_net_roe):
+        live  → avg+size from positions_live() (REAL fill + REAL size)
+        paper → avg+size from active_trades (simulated entry + tracked size)
+      marks always from all_mids() (the live mid feed — HL's equivalent of
+      CoinDCX's rt ticker, so the ladder reads a fresh price, not a stale one).
+    pos_map: {coin: {side, avg, qty_abs, leverage}}. Returns (None, marks) if the
+    needed source is unavailable this cycle so the worker can skip without acting
+    blind; (None, None) if even the mark feed is down."""
+    marks = client.all_mids()
+    if not marks:
+        return None, None
+    pos_map = {}
+    if PAPER_MODE:
+        for coin, t in list(active_trades.items()):
+            pos_map[coin] = {
+                "side": t.get("side"),
+                "avg": float(t.get("entry_price", 0) or 0),
+                "qty_abs": float(t.get("qty", 0) or 0),
+                "leverage": t.get("leverage", DEFAULT_LEVERAGE),
+            }
+    else:
+        poss = client.positions_live()
+        if poss is None:
+            return None, marks  # position fetch failed — skip, never act blind
+        for p in poss:
+            c = p.get("coin")
+            if not c:
+                continue
+            pos_map[c] = {
+                "side": p.get("side"),
+                "avg": float(p.get("entry", 0) or 0),
+                "qty_abs": float(p.get("qty", 0) or 0),
+                "leverage": p.get("leverage") or DEFAULT_LEVERAGE,
+            }
+    return pos_map, marks
+
+
+def _ladder_close(coin, close_side, qty, price, lev, reason):
+    """Reduce-only market close via place_market. Returns (ok, qty_used). ok=False
+    on exchange error so the caller keeps the tracker and retries next poll (never
+    orphan). The caller records realized P&L (it holds the avg) after a fill, so
+    the paper wallet and baseline stay correct. `price` is the live price_hint /
+    paper exit; HL's close_market infers direction (reduce-only)."""
+    result = place_market(coin, close_side, qty, lev, reduce_only=True, price_hint=price)
+    if isinstance(result, dict) and result.get("status") == "error":
+        log.warning(f"⚠️ ladder {reason} failed for {coin}: {result.get('message','')}")
+        return False, 0.0
+    used = float(result.get("total_quantity", qty) or qty) if isinstance(result, dict) else qty
+    return True, used
+
+
+def _ladder_step(coin, pos, mark):
+    """One ladder evaluation for one coin (lock-free — see server_exit_worker).
+    `pos` is {side, avg, qty_abs, leverage} from _ladder_fetch (real fill+size in
+    live, tracked in paper), or None if the coin isn't confirmed on the exchange
+    yet / already flat. `mark` is the live mid from all_mids().
+
+      1. ARM on first confirmation — anchor to the REAL avg fill, capture real
+         opened size, set the initial stop.
+      2. SIDE-CONSISTENCY GUARD — if tracked side ≠ exchange side (a flip landed
+         mid-cycle), skip; next poll re-evaluates cleanly.
+      3. BREACH CHECK against the committed (ratcheted) SL → flatten remaining, go
+         flat. No reverse — Pine's next entry drives direction.
+      4. ADVANCE — book BOOK_PCT of original at each new rung up to MAX_BOOKS
+         (catches up gaps), then ratchet the trailing SL one rung behind the
+         highest rung crossed. SL never loosens.
+    """
+    global _server_exit_closes
+    trade = active_trades.get(coin)
+    if not trade or not pos:
+        return  # not tracked, or not confirmed on the exchange yet
+    side    = pos["side"]
+    avg     = float(pos.get("avg", 0) or 0)
+    mark    = float(mark or 0)
+    qty_abs = float(pos.get("qty_abs", 0) or 0)
+    lev     = trade.get("leverage", pos.get("leverage", DEFAULT_LEVERAGE))
+    if avg <= 0 or mark <= 0 or qty_abs <= 0 or not side:
+        return
+
+    # ── 1. ARM on first confirmation ──────────────────────
+    if not trade.get("avg_entry"):
+        trade["avg_entry"]       = avg
+        trade["ladder_orig_qty"] = qty_abs
+        trade["ladder_books"]    = 0
+        trade["ladder_sl"]       = _sl_level(side, avg)
+        trade["entry_price"]     = avg          # keep human-visible entry honest
+        _save_active_trades()
+        log.info(f"🪜 LADDER armed: {coin} {side.upper()} avg={avg} qty={qty_abs} "
+                 f"SL0={trade['ladder_sl']:.8f} (−{SL_PCT}% / +{SL_PCT}%)")
+
+    # ── 2. SIDE-CONSISTENCY GUARD (lock-free safety) ──────
+    # A flip (close+reopen opposite) can land between the fetch and now. If the
+    # tracker's side no longer matches the exchange side, skip this cycle rather
+    # than act on a stale snapshot; the next poll re-arms/evaluates correctly.
+    if trade.get("side") and trade["side"] != side:
+        if LADDER_VERBOSE:
+            log.info(f"🪜 ladder[{coin}] side mismatch tracked={trade['side']} "
+                     f"exch={side} — skip (flip in flight)")
+        return
+
+    avg    = float(trade["avg_entry"])
+    cur_sl = float(trade["ladder_sl"])
+    books  = int(trade.get("ladder_books", 0))
+    orig   = float(trade.get("ladder_orig_qty", qty_abs))
+    close_side = "sell" if side == "buy" else "buy"
+
+    # ── 3. BREACH CHECK FIRST (committed stop) ────────────
+    if _sl_breached(side, mark, cur_sl):
+        reason = "server_sl" if books == 0 else "server_trail_sl"
+        log.warning(f"🛡️ LADDER STOP: {coin} {side.upper()} mark={mark} hit SL={cur_sl:.8f} "
+                    f"(books={books}) — flatten {close_side.upper()} {qty_abs}")
+        ok, used = _ladder_close(coin, close_side, qty_abs, mark, lev, reason)
+        if not ok:
+            return  # keep tracker, retry next poll — never orphan
+        record_realized(coin, avg, mark, used, side)
+        clear_active_trade(coin, f"ladder stop (books={books})")
+        log_trade_event(coin, close_side, reason, "FILLED",
+                        f"mark={mark} sl={cur_sl:.8f} books={books}")
+        _server_exit_closes += 1
+        log.info(f"🛡️ LADDER closed {coin} (total ladder closes: {_server_exit_closes})")
+        return
+
+    # ── 4. ADVANCE — books at rungs, then ratchet trail ───
+    k = _rungs_crossed(side, mark, avg)
+    if LADDER_VERBOSE:
+        prof = ((mark - avg) / avg if side == "buy" else (avg - mark) / avg) * 100.0
+        log.info(f"🪜 ladder[{coin}] {side} mark={mark} avg={avg} "
+                 f"prof={prof:+.2f}% roe≈{prof*float(lev):+.1f}% k={k} "
+                 f"books={books}/{MAX_BOOKS} sl={cur_sl:.8f}")
+    target_books = min(MAX_BOOKS, k)
+    remaining  = qty_abs
+    booked_any = False
+    while books < target_books and remaining > 0:
+        book_qty = round_down_quantity(coin, orig * (BOOK_PCT / 100.0))
+        book_qty = min(book_qty, remaining)
+        if book_qty <= 0:
+            break
+        log.info(f"🪜 LADDER BOOK #{books+1}/{MAX_BOOKS}: {coin} close {close_side.upper()} "
+                 f"{book_qty} of {remaining} (rung {books+1}, mark={mark})")
+        ok, used = _ladder_close(coin, close_side, book_qty, mark, lev,
+                                 f"server_book_{books+1}")
+        if not ok:
+            break  # retry this book next poll; don't advance the counter
+        record_realized(coin, avg, mark, used, side)
+        remaining -= used
+        books += 1
+        booked_any = True
+        log_trade_event(coin, close_side, "server_book", "FILLED",
+                        f"book #{books} qty={used} remaining≈{remaining:.8f}")
+
+    target_sl = _ladder_sl_target(side, avg, k)
+    new_sl    = _ratchet_sl(side, cur_sl, target_sl)
+
+    if booked_any:
+        trade["ladder_books"] = books
+        trade["qty"] = remaining            # keep tracked qty sane for /status
+    if new_sl != cur_sl:
+        log.info(f"🪜 LADDER trail: {coin} SL {cur_sl:.8f} → {new_sl:.8f} "
+                 f"(rungs={k}, books={books})")
+        trade["ladder_sl"] = new_sl
+    if booked_any or new_sl != cur_sl:
+        _save_active_trades()
+
+
+def server_exit_worker():
+    """Server-owned exit ladder. Every EXIT_POLL_SEC it pulls one positions
+    snapshot + the live mid feed and evaluates the ladder per tracked coin.
+    Self-gates on SERVER_EXITS_ENABLED (default false ⇒ dark).
+
+    Concurrency: lock-free, matching this file's design (the signal worker is
+    serial; reconciler/profit-lock/baseline mutate active_trades lock-free too).
+    Safety comes from: (a) closes are REDUCE-ONLY sized by the real position, so
+    a race can only over-reduce, never flip or open exposure; (b) a
+    side-consistency guard in _ladder_step skips a coin mid-flip; (c) the
+    reconciler's qty-drift detection + _sweep_residual_positions self-heal any
+    residual. Adding a lock would mean wrapping process_signal + reconciler +
+    every closer — a large, risky change divergent from how this file is built."""
+    global _server_exit_last_check_at, _server_exit_last_error
+    log.info(f"🪜 Server-exit (full ladder) started — enabled={SERVER_EXITS_ENABLED}, "
+             f"mode={'paper' if PAPER_MODE else 'live'}, "
+             f"SL={SL_PCT}% TP_STEP={TP_STEP_PCT}% BOOK={BOOK_PCT}%×{MAX_BOOKS} "
+             f"poll={EXIT_POLL_SEC}s")
+    while True:
+        try:
+            time.sleep(EXIT_POLL_SEC)
+            if not SERVER_EXITS_ENABLED or not active_trades:
+                continue
+            pos_map, marks = _ladder_fetch()
+            _server_exit_last_check_at = datetime.now(timezone.utc).isoformat()
+            if not marks:
+                _server_exit_last_error = "mark feed fetch failed"
+                continue
+            if pos_map is None:
+                _server_exit_last_error = "positions fetch failed"
+                continue
+            _server_exit_last_error = None
+            for coin in list(active_trades.keys()):
+                try:
+                    _ladder_step(coin, pos_map.get(coin), marks.get(coin))
+                except Exception as e:
+                    log.error(f"ladder step error for {coin}: {e}", exc_info=True)
+        except Exception as e:
+            _server_exit_last_error = str(e)
+            log.error(f"server_exit_worker error: {e}", exc_info=True)
+
+
+def _wait_flat_hl(coin, timeout=3.0, poll=0.3):
+    """Poll positions_live(force=True) until `coin` is flat on the exchange, or
+    timeout. Returns True if confirmed flat, False if still open after timeout
+    (caller should then ABORT a reopen rather than risk double-margin-lock).
+    Paper mode has no real positions → returns True immediately. force=True
+    bypasses the TTL cache so we never read a stale pre-close snapshot."""
+    if PAPER_MODE:
+        return True
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        poss = client.positions_live(force=True)
+        if poss is None:
+            time.sleep(poll)
+            continue  # fetch blip — keep trying within the window
+        still_open = any(
+            p.get("coin") == coin and abs(float(p.get("qty") or 0)) > 0 for p in poss
+        )
+        if not still_open:
+            return True
+        time.sleep(poll)
+    return False
+
+
+# ═══════════════════════════════════════════════════════════
 #  WEBHOOK HANDLER — Pine drives all decisions
 # ═══════════════════════════════════════════════════════════
 @app.route("/webhook", methods=["POST"])
@@ -1230,10 +1546,79 @@ def process_signal(data, enqueued_at):
         if alert_type == "entry":
             if symbol in active_trades:
                 trade = active_trades[symbol]
-                mins = int((time.time() - trade["entry_time"]) // 60)
-                log.info(f"🚫 SKIP entry: {symbol} already active ({mins}m, {trade['side']})")
-                log_trade_event(symbol, action, "entry", "SKIP", f"already active ({mins}m)")
-                return jsonify({"status": "skipped", "reason": "already active"}), 200
+                # ─── SKIP unless this is a flip on the new architecture ───
+                # Same direction (don't stack) OR server-exits off → skip, exactly
+                # like before. The flip path is entry-only-Pine behaviour and is
+                # coupled to SERVER_EXITS_ENABLED, so a non-cutover account keeps
+                # the old "skip if already active" rule (provably dormant).
+                if action == trade["side"] or not SERVER_EXITS_ENABLED:
+                    mins = int((time.time() - trade["entry_time"]) // 60)
+                    why = "same dir" if action == trade["side"] else "server-exits off"
+                    log.info(f"🚫 SKIP entry: {symbol} already active ({mins}m, {trade['side']}, {why})")
+                    log_trade_event(symbol, action, "entry", "SKIP", f"already active ({mins}m, {why})")
+                    return jsonify({"status": "skipped", "reason": f"already active ({why})"}), 200
+
+                # ─── OPPOSITE DIRECTION — Pine-driven reverse (flip) ──
+                # Close-current-open-new: flatten the existing leg by REAL size,
+                # confirm flat (never double-margin-lock), then reopen the new
+                # direction and let the ladder re-arm fresh. Closes via reduce-only
+                # (place_market) + record_realized so paper/baseline stay correct.
+                flip_prev_side = trade["side"]
+                flip_entry_px  = trade["entry_price"]
+                flip_close_qty = trade["qty"]
+                log.info(f"🔄 FLIP: {symbol} {flip_prev_side.upper()}→{action.upper()} "
+                         f"(opposite-direction Pine entry)")
+                cancel_native_sl(symbol)
+                if flip_close_qty > 0:
+                    log.info(f"🔻 FLIP close: {_close_side(trade)} {flip_close_qty} {symbol}")
+                    flip_res = place_market(symbol, _close_side(trade), flip_close_qty,
+                                            trade.get("leverage", leverage), reduce_only=True,
+                                            price_hint=coin_price)
+                    if isinstance(flip_res, dict) and flip_res.get("status") == "error":
+                        log.warning(f"⚠️ Flip close failed (likely already closed): "
+                                    f"{flip_res.get('message','')}")
+                record_realized(symbol, flip_entry_px, coin_price, flip_close_qty, flip_prev_side)
+                clear_active_trade(symbol, f"flip {flip_prev_side}→{action}")
+                log_trade_event(symbol, _close_side(trade), "flip_close", "FILLED",
+                                f"{flip_prev_side}→{action}")
+
+                # Confirm flat before reopening; abort (stay flat) if it didn't settle.
+                if not _wait_flat_hl(symbol, timeout=3.0, poll=0.3):
+                    log.error(f"❌ ABORT flip reopen for {symbol} — still open after 3s. "
+                              f"Staying flat; next Pine entry re-enters cleanly.")
+                    log_trade_event(symbol, action, "flip_entry", "ABORT", "close did not settle")
+                    return jsonify({"status": "aborted",
+                                    "reason": f"flip close on {symbol} did not settle"}), 200
+
+                # Reopen in the new direction (sizes/tracks like a fresh entry;
+                # ladder arms on its next poll).
+                quantity = calc_quantity(symbol, coin_price, leverage)
+                if quantity <= 0:
+                    log.error(f"❌ REJECT flip entry: {symbol} — qty=0")
+                    log_trade_event(symbol, action, "flip_entry", "REJECT", "qty=0")
+                    return jsonify({"status": "rejected", "reason": "flip entry qty=0"}), 200
+
+                log.info(f"🔄 FLIP entry: {action.upper()} {quantity} {symbol} | TP={tp_price} SL={sl_price}")
+                result = place_market(symbol, action, quantity, leverage,
+                                      reduce_only=False, price_hint=coin_price)
+                if isinstance(result, dict) and result.get("status") == "error":
+                    err = result.get("message", "")
+                    log.error(f"❌ Flip entry failed: {err}")
+                    log_trade_event(symbol, action, "flip_entry", "REJECT", err)
+                    return jsonify({"status": "rejected", "reason": err}), 200
+
+                order_id   = result.get("id", "unknown")
+                filled_qty = float(result.get("total_quantity", quantity) or quantity)
+                entry_px   = float(result.get("avg_price") or coin_price)
+                set_active_trade(symbol, action, filled_qty, entry_px, order_id,
+                                 tp_price=tp_price, sl_price=sl_price,
+                                 leverage=leverage, margin_ccy=margin_ccy)
+                log_trade_event(symbol, action, "flip_entry", "FILLED",
+                                f"{flip_prev_side}→{action} TP={tp_price} SL={sl_price}")
+                if sl_price:
+                    place_native_sl(symbol, action, filled_qty, sl_price, leverage, margin_ccy)
+                return jsonify({"status": "flipped", "from": flip_prev_side,
+                                "to": action, "order": result}), 200
 
             # ─── POSITION CAP — hard ceiling on concurrent coins ───
             # A fresh entry on a NEW coin is rejected once the bot already holds
@@ -1459,6 +1844,21 @@ def status():
             "cap": MAX_POSITIONS,
             "open": len(active_trades),
             "at_cap": (MAX_POSITIONS > 0 and len(active_trades) >= MAX_POSITIONS),
+        },
+        "server_exits": {
+            "enabled": SERVER_EXITS_ENABLED,
+            "phase": "full_ladder",
+            "mark_source": "all_mids",
+            "mode": "paper" if PAPER_MODE else "live",
+            "verbose": LADDER_VERBOSE,
+            "sl_pct": SL_PCT,
+            "tp_step_pct": TP_STEP_PCT,
+            "book_pct": BOOK_PCT,
+            "max_books": MAX_BOOKS,
+            "poll_sec": EXIT_POLL_SEC,
+            "closes_total": _server_exit_closes,
+            "last_check_at": _server_exit_last_check_at,
+            "last_error": _server_exit_last_error,
         },
         "profit_lock": {
             "enabled": PROFIT_LOCK_ENABLED,
@@ -1944,6 +2344,17 @@ log.info(f"📈 Streak initialized — enabled={STREAK_ENABLED}, count={_streak_
 
 # Start the position reconciler (self-gates on RECONCILER_ENABLED + live mode).
 threading.Thread(target=reconcile_worker, daemon=True).start()
+
+# Start the server-owned exit ladder (self-gates on SERVER_EXITS_ENABLED ⇒ dark
+# by default). Lock-free, matching this file's design.
+threading.Thread(target=server_exit_worker, daemon=True).start()
+log.info(f"🪜 Server-exit initialized — enabled={SERVER_EXITS_ENABLED}, "
+         f"mode={'paper' if PAPER_MODE else 'live'}, SL={SL_PCT}%, "
+         f"TP_STEP={TP_STEP_PCT}%, BOOK={BOOK_PCT}%×{MAX_BOOKS}, poll={EXIT_POLL_SEC}s")
+# Pine-flip on opposite-direction entry is coupled to SERVER_EXITS_ENABLED (see
+# the entry handler). Log it so the build is confirmable from the boot line.
+log.info(f"🔄 Pine-flip on opposite entry: {'ON' if SERVER_EXITS_ENABLED else 'OFF'} "
+         f"(close-current-open-new; gated on SERVER_EXITS_ENABLED)")
 
 # Start the async signal worker (drains the webhook queue serially).
 if ASYNC_QUEUE_ENABLED:
