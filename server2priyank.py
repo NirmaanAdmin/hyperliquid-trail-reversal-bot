@@ -1488,7 +1488,9 @@ def process_signal(data, enqueued_at):
         leverage = clamp_leverage(symbol, leverage)
 
         # ─── DAILY CAP HARD-STOP GATE ─────────────────────────
-        if daily_cap_active():
+        # Scoped to ENTRY/REVERSE. CLOSE and BOOK must always pass — see the
+        # note on the profit-lock cooldown gate below for why.
+        if daily_cap_active() and alert_type in ("entry", "reverse"):
             log.info(f"🛑 DAILY CAP: rejecting {alert_type} for {symbol} "
                      f"(cumulative {_daily_locked_pct_sum:.2f}% / cap {DAILY_CAP_PCT}%)")
             log_trade_event(symbol, action, alert_type, "DAILY_CAP", f"sum={_daily_locked_pct_sum:.2f}%")
@@ -1499,7 +1501,7 @@ def process_signal(data, enqueued_at):
         # Pause triggered by N consecutive profit-locks. Auto-resumes (with
         # counter reset) once STREAK_PAUSE_SEC elapses.
         _maybe_resume_after_streak_pause()
-        if streak_pause_active():
+        if streak_pause_active() and alert_type in ("entry", "reverse"):
             remaining = streak_pause_remaining_sec()
             log.info(f"📈 STREAK PAUSE: rejecting {alert_type} for {symbol} — {remaining}s left "
                      f"(streak {_streak_count}/{STREAK_THRESHOLD})")
@@ -1509,7 +1511,19 @@ def process_signal(data, enqueued_at):
                             "reason": f"streak pause ({remaining}s)"}), 200
 
         # ─── PROFIT-LOCK COOLDOWN GATE ────────────────────────
-        if in_profit_lock_cooldown():
+        # SCOPED TO ENTRY/REVERSE — closes and books must never be blocked.
+        #
+        # This is the CoinDCX TAO phantom-entry fix (May 31 2026), backported.
+        # Root cause there: close_all_positions() sets the cooldown BEFORE it
+        # finishes iterating positions, so in-flight Pine closes landing in that
+        # window were rejected. The tracker was then cleared anyway, Pine's wait
+        # bars elapsed, and the next entry fired into a book the server believed
+        # was empty. A blocked close leaves a live position with no exit
+        # primitive — and on this bot NATIVE_SL_ENABLED defaults false, so the
+        # ladder thread is the only stop that exists.
+        #
+        # The loss lock shares _profit_lock_until, so this covers both.
+        if in_profit_lock_cooldown() and alert_type in ("entry", "reverse"):
             remaining = cooldown_remaining_sec()
             log.info(f"🔒 COOLDOWN: rejecting {alert_type} for {symbol} — {remaining}s left")
             log_trade_event(symbol, action, alert_type, "COOLDOWN", f"{remaining}s remaining")
