@@ -5,12 +5,53 @@ import time
 import queue
 import logging
 import threading
+import hmac as _hmac_cmp
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify
 from hyperliquid_client import HyperliquidFutures
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("bot")
+
+
+# ═══════════════════════════════════════════════════════════
+#  AUTH HELPERS  (parity with server2.py)
+# ═══════════════════════════════════════════════════════════
+# Ported verbatim from the CoinDCX server. Before this, every read endpoint on
+# this deployment was PUBLIC — /status returned open positions, wallet value
+# and full config to anyone holding the Railway URL. On a live account that is
+# an information leak, not a convenience.
+#
+# FAILS CLOSED: if WEBHOOK_SECRET is unset, _secret_ok returns False for every
+# request, so an unconfigured deploy locks itself down rather than opening up.
+#
+# Accepts the secret from the X-Auth-Secret HEADER (preferred — keeps it out of
+# Railway access logs and browser history) or the ?secret= query param, which
+# the existing endpoints already used. Old bookmarks that pass ?secret= keep
+# working unchanged; that is deliberate, so nothing breaks on deploy.
+def _secret_ok(provided):
+    """Constant-time secret check. Fails closed when WEBHOOK_SECRET is unset."""
+    if not WEBHOOK_SECRET:
+        return False
+    if not provided:
+        return False
+    return _hmac_cmp.compare_digest(str(provided), WEBHOOK_SECRET)
+
+
+def _request_secret():
+    """Pull the secret from the X-Auth-Secret header (preferred — keeps it out
+    of access logs / browser history) or the ?secret= query param (legacy)."""
+    return request.headers.get("X-Auth-Secret") or request.args.get("secret")
+
+
+def _redact(d):
+    """Copy of a webhook payload with the secret masked, for safe logging."""
+    if not isinstance(d, dict):
+        return d
+    out = dict(d)
+    if "secret" in out:
+        out["secret"] = "***"
+    return out
 
 # ═══════════════════════════════════════════════════════════
 #  CONFIG  (Hyperliquid + USDC-native)
@@ -1411,9 +1452,10 @@ def webhook():
     except Exception:
         return jsonify({"error": "bad json"}), 400
 
-    log.info(f"📩 Webhook: {json.dumps(data)}")
+    # Redacted: never write the shared secret into Railway logs.
+    log.info(f"📩 Webhook: {json.dumps(_redact(data))}")
 
-    if WEBHOOK_SECRET and data.get("secret") != WEBHOOK_SECRET:
+    if not _secret_ok(data.get("secret")):
         return jsonify({"error": "unauthorized"}), 401
     if data.get("action", "").lower() not in ("buy", "sell"):
         return jsonify({"status": "rejected", "reason": "invalid action"}), 200
@@ -1748,7 +1790,17 @@ def process_signal(data, enqueued_at):
                 clear_active_trade(symbol, "reverse — SL hit")
                 log_trade_event(symbol, _close_side(trade), "reverse_close", "FILLED", "Pine reverse")
 
-            time.sleep(1)
+                # Confirm flat before reopening — parity with the flip path above.
+                # The old blind `time.sleep(1)` is a guess, not a confirmation:
+                # on a close+reopen race the reopen can lock fresh margin before
+                # the close's release propagates. Abort and stay flat rather than
+                # stack margin; the next Pine entry re-enters cleanly.
+                if not _wait_flat_hl(symbol, timeout=3.0, poll=0.3):
+                    log.error(f"❌ ABORT reverse reopen for {symbol} — still open after 3s. "
+                              f"Staying flat; next Pine entry re-enters cleanly.")
+                    log_trade_event(symbol, action, "reverse_entry", "ABORT", "close did not settle")
+                    return jsonify({"status": "aborted",
+                                    "reason": f"reverse close on {symbol} did not settle"}), 200
 
             quantity = calc_quantity(symbol, coin_price, leverage)
             if quantity <= 0:
@@ -1805,7 +1857,8 @@ def process_signal(data, enqueued_at):
                 close_qty = trade["qty"]
                 if close_qty > 0:
                     reason_label = {"sl_wait": "SL-WAIT", "tp_hit": "TP", "sl_hit": "SL",
-                                    "timer_expired": "TIMER", "kill_switch": "KILL"}.get(reason, reason.upper())
+                                    "timer_expired": "TIMER", "kill_switch": "KILL",
+                                    "gate_block": "GATE-BLOCK"}.get(reason, reason.upper())
                     log.info(f"🔻 {reason_label} close: {close_qty} {symbol}")
                     result = place_market(symbol, _close_side(trade), close_qty,
                                           trade.get("leverage", leverage), reduce_only=True,
@@ -1839,6 +1892,11 @@ def process_signal(data, enqueued_at):
 # ═══════════════════════════════════════════════════════════
 @app.route("/status", methods=["GET"])
 def status():
+    # NEWLY GATED for parity with server2.py. This endpoint returns open
+    # positions, wallet value and full config — it was public before.
+    # Accepts X-Auth-Secret header OR ?secret= query param.
+    if not _secret_ok(_request_secret()):
+        return jsonify({"error": "unauthorized"}), 401
     pnl, margin, pct = compute_net_roe()
     pct_str = f"{pct:.2f}" if pct is not None else "unavailable"
     _check_and_reset_daily_counter()
@@ -1954,7 +2012,7 @@ def profit_lock_check():
 
 @app.route("/profit-lock/force", methods=["POST", "GET"])
 def profit_lock_force():
-    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+    if not _secret_ok(_request_secret()):
         return jsonify({"error": "unauthorized"}), 401
     if not active_trades:
         return jsonify({"status": "no_positions", "active": 0})
@@ -1991,7 +2049,7 @@ def flatten():
     positions:0 but the exchange still has live positions (orphaned state).
     Unlike /profit-lock/force (which only closes active_trades), this sweeps
     the exchange directly. Requires ?secret=... . Does NOT set a cooldown."""
-    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+    if not _secret_ok(_request_secret()):
         return jsonify({"error": "unauthorized"}), 401
     before = client.positions_live()
     before_n = len(before) if before is not None else None
@@ -2011,7 +2069,7 @@ def flatten():
 @app.route("/daily-cap/reset", methods=["POST", "GET"])
 def daily_cap_reset():
     global _daily_locked_pct_sum, _daily_lock_count, _daily_paused, _daily_counter_date
-    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+    if not _secret_ok(_request_secret()):
         return jsonify({"error": "unauthorized"}), 401
     prev_sum, prev_count, prev_paused = _daily_locked_pct_sum, _daily_lock_count, _daily_paused
     _daily_locked_pct_sum = 0.0
@@ -2064,7 +2122,7 @@ def clear_lock():
 
 @app.route("/clear-tracking", methods=["GET", "POST"])
 def clear_tracking():
-    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+    if not _secret_ok(_request_secret()):
         return jsonify({"status": "error", "reason": "invalid or missing secret"}), 403
     symbol = request.args.get("symbol")
     if not symbol:
@@ -2106,7 +2164,7 @@ def sl_lockout_status():
 
 @app.route("/sl-lockout/clear", methods=["POST", "GET"])
 def sl_lockout_clear():
-    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+    if not _secret_ok(_request_secret()):
         return jsonify({"error": "unauthorized"}), 401
     symbol = request.args.get("symbol")
     if symbol:
@@ -2141,7 +2199,7 @@ def target_status():
 @app.route("/target/set", methods=["POST", "GET"])
 def target_set():
     global _target_value, _target_hit, _target_hit_at
-    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+    if not _secret_ok(_request_secret()):
         return jsonify({"error": "unauthorized"}), 401
     raw = request.args.get("value")
     if raw is None:
@@ -2167,7 +2225,7 @@ def target_set():
 @app.route("/target/clear", methods=["POST", "GET"])
 def target_clear():
     global _target_value, _target_hit, _target_hit_at
-    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+    if not _secret_ok(_request_secret()):
         return jsonify({"error": "unauthorized"}), 401
     old_value = _target_value
     _target_value = 0.0
@@ -2212,7 +2270,7 @@ def baseline_status():
 
 @app.route("/baseline/set", methods=["POST", "GET"])
 def baseline_set():
-    if request.args.get("secret") != WEBHOOK_SECRET:
+    if not _secret_ok(_request_secret()):
         return jsonify({"error": "unauthorized"}), 401
     raw = request.args.get("value")
     if raw is None:
@@ -2236,7 +2294,7 @@ def baseline_set():
 
 @app.route("/baseline/reset", methods=["POST", "GET"])
 def baseline_reset():
-    if request.args.get("secret") != WEBHOOK_SECRET:
+    if not _secret_ok(_request_secret()):
         return jsonify({"error": "unauthorized"}), 401
     global _baseline_usdt, _baseline_realized_pnl, _baseline_lock_count
     global _baseline_last_lock_at, _baseline_history, _baseline_cooldown_until
@@ -2275,7 +2333,7 @@ def reconcile_status():
 def reconcile_run():
     """Force an immediate reconciliation pass (adopts orphans / clears ghosts
     per config). Requires ?secret=... ."""
-    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+    if not _secret_ok(_request_secret()):
         return jsonify({"error": "unauthorized"}), 401
     return jsonify({"status": "ok", "result": reconcile_once()}), 200
 
@@ -2300,7 +2358,7 @@ def streak_status_endpoint():
 def streak_reset():
     """Manually clear the streak counter and lift any active streak pause.
     Requires ?secret=... ."""
-    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+    if not _secret_ok(_request_secret()):
         return jsonify({"error": "unauthorized"}), 401
     global _streak_count, _streak_pause_until
     prev_count = _streak_count
