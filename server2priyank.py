@@ -118,6 +118,41 @@ NATIVE_SL_ENABLED = os.environ.get("NATIVE_SL_ENABLED", "false").lower() == "tru
 # baseline accounting stay correct (a gap the CoinDCX ladder actually has).
 # Lock-free, matching this file's design — see server_exit_worker for the
 # concurrency note (reduce-only closes + side-consistency guard + reconciler).
+# ═══════════════════════════════════════════════════════════
+#  MAX HOLD TIMER — hard time-based exit per position
+# ═══════════════════════════════════════════════════════════
+# A position is only tradable for MAX_HOLD_SEC seconds. When that elapses the
+# server market-closes whatever remains, at whatever price, booking the profit
+# or loss as it stands. A HARD CAP on holding time and nothing else: it does
+# not look at P&L, ladder state, rungs booked, or direction.
+#
+# NO RE-ENTRY LOCKOUT. The coin is immediately eligible again — the next Pine
+# entry re-enters normally. Deliberately UNLIKE the sl_wait path, which arms
+# SL_LOCKOUT_SEC. Closes are logged as "timer_expired", never "sl_wait", so no
+# lockout is armed.
+#
+# THE CLOCK IS PER-POSITION, NOT PER-COIN. It starts at entry_time, stamped by
+# set_active_trade() on EVERY open — including the reopen half of a flip. So a
+# flip resets the clock and the new leg gets a full MAX_HOLD_SEC of its own.
+#
+# SURVIVES RESTARTS. entry_time lives in active_trades, persisted to /app/data.
+# A position opened 00:00 with a 12h cap still closes at 12:00 even if the
+# container restarted at 06:00 — age is recomputed from the stored stamp, not
+# from process uptime.
+#
+# INDEPENDENT OF THE LADDER. Does not require SERVER_EXITS_ENABLED. With the
+# ladder off this is still the guarantee that nothing is held indefinitely.
+#
+# Set MAX_HOLD_SEC=0 (default) to disable. Examples:
+#     43200 = 12h      86400 = 24h      3600 = 1h      1800 = 30m
+MAX_HOLD_ENABLED   = os.environ.get("MAX_HOLD_ENABLED", "true").lower() == "true"
+MAX_HOLD_SEC       = float(os.environ.get("MAX_HOLD_SEC", "0"))       # 0 = disabled
+MAX_HOLD_POLL_SEC  = float(os.environ.get("MAX_HOLD_POLL_SEC", "10"))
+
+_max_hold_closes        = 0
+_max_hold_last_check_at = None
+_max_hold_last_error    = None
+
 SERVER_EXITS_ENABLED = os.environ.get("SERVER_EXITS_ENABLED", "false").lower() == "true"
 SL_PCT               = float(os.environ.get("SL_PCT", "3.0"))        # initial stop, price %
 TP_STEP_PCT          = float(os.environ.get("TP_STEP_PCT", "4.0"))   # rung spacing, price %
@@ -1373,6 +1408,112 @@ def _ladder_step(coin, pos, mark):
         _save_active_trades()
 
 
+# ═══════════════════════════════════════════════════════════
+#  MAX HOLD TIMER WORKER
+# ═══════════════════════════════════════════════════════════
+def _max_hold_close(coin, trade, age):
+    """Market-close whatever remains of `coin` because its hold time expired.
+    Returns True if the tracker was cleared, False if the close failed and the
+    tracker must be kept for a retry on the next poll.
+
+    REDUCE-ONLY: the close goes through place_market(..., reduce_only=True) →
+    client.close_market(), which Hyperliquid enforces exchange-side. A stale
+    tracker can therefore only over-reduce (a no-op once flat) — it can never
+    open a reverse position. This is why no clamp_close_qty equivalent is
+    needed here, unlike the CoinDCX server where the same timer had to size
+    against a live positions read first."""
+    global _max_hold_closes
+    close_qty = float(trade.get("qty", 0) or 0)
+    if close_qty <= 0:
+        clear_active_trade(coin, "max-hold — nothing to close")
+        return True
+
+    log.warning(f"⏱ MAX-HOLD EXPIRED: {coin} held {age/3600:.2f}h "
+                f"(cap {MAX_HOLD_SEC/3600:.2f}h) — closing {close_qty} at market")
+
+    result = place_market(coin, _close_side(trade), close_qty,
+                          trade.get("leverage", DEFAULT_LEVERAGE),
+                          reduce_only=True)
+    if isinstance(result, dict) and result.get("status") == "error":
+        # Keep the tracker so the next poll retries. Never orphan a position by
+        # clearing state after a failed close.
+        log.error(f"❌ MAX-HOLD close FAILED for {coin}: {result.get('message','')} — "
+                  f"keeping tracker, retrying in {MAX_HOLD_POLL_SEC}s")
+        return False
+
+    cancel_native_sl(coin)
+    # Realize P&L into the paper wallet / baseline accumulator, same as any
+    # other exit path on this server.
+    try:
+        exit_px = (result.get("avg_price") if isinstance(result, dict) else None) or client.mid(coin)
+        record_realized(coin, trade.get("entry_price"), exit_px, close_qty, trade.get("side"))
+    except Exception as e:
+        log.warning(f"max-hold: realized-P&L record failed for {coin}: {e}")
+
+    _max_hold_closes += 1
+    clear_active_trade(coin, f"max-hold {age/3600:.2f}h")
+    log_trade_event(coin, _close_side(trade), "timer_expired", "FILLED",
+                    f"held {age/3600:.2f}h ≥ cap {MAX_HOLD_SEC/3600:.2f}h")
+    return True
+
+
+def max_hold_worker():
+    """Background thread: every MAX_HOLD_POLL_SEC, closes any tracked position
+    whose age since entry_time exceeds MAX_HOLD_SEC.
+
+    Deliberately INDEPENDENT of SERVER_EXITS_ENABLED — with the ladder off this
+    is still the guarantee that nothing is held forever.
+
+    Concurrency: lock-free, matching this file's design (see the note on
+    server_exit_worker). Safety comes from the close being REDUCE-ONLY, so a
+    race with the signal worker can only over-reduce, never open exposure.
+
+    The clock is read from the PERSISTED entry_time, so a container restart
+    does not reset it."""
+    global _max_hold_last_check_at, _max_hold_last_error
+    log.info(f"⏱ Max-hold timer started — enabled={MAX_HOLD_ENABLED}, "
+             f"cap={MAX_HOLD_SEC}s ({MAX_HOLD_SEC/3600:.2f}h), "
+             f"poll={MAX_HOLD_POLL_SEC}s"
+             + ("" if MAX_HOLD_SEC > 0 else "  [DISABLED — MAX_HOLD_SEC=0]"))
+    while True:
+        try:
+            time.sleep(MAX_HOLD_POLL_SEC)
+            if not MAX_HOLD_ENABLED or MAX_HOLD_SEC <= 0:
+                continue
+            if not active_trades:
+                continue
+            now = time.time()
+            _max_hold_last_check_at = datetime.now(timezone.utc).isoformat()
+            expired = []
+            for coin, trade in list(active_trades.items()):
+                try:
+                    et = float(trade.get("entry_time", 0) or 0)
+                except (TypeError, ValueError):
+                    et = 0.0
+                if et <= 0:
+                    # No usable stamp (hand-injected tracker). Stamp now so the
+                    # cap starts from this moment rather than closing instantly.
+                    trade["entry_time"] = now
+                    _save_active_trades()
+                    log.warning(f"⏱ MAX-HOLD: {coin} had no entry_time — stamping now, "
+                                f"cap starts from this moment")
+                    continue
+                if now - et >= MAX_HOLD_SEC:
+                    expired.append((coin, now - et))
+            for coin, age in expired:
+                trade = active_trades.get(coin)
+                if not trade:
+                    continue  # closed by the ladder / a webhook in the meantime
+                try:
+                    _max_hold_close(coin, trade, age)
+                except Exception as e:
+                    log.error(f"max-hold close error for {coin}: {e}", exc_info=True)
+            _max_hold_last_error = None
+        except Exception as e:
+            _max_hold_last_error = str(e)
+            log.error(f"max_hold_worker error: {e}", exc_info=True)
+
+
 def server_exit_worker():
     """Server-owned exit ladder. Every EXIT_POLL_SEC it pulls one positions
     snapshot + the live mid feed and evaluates the ladder per tracked coin.
@@ -1941,6 +2082,27 @@ def status():
             "in_cooldown": in_profit_lock_cooldown(),
             "cooldown_remaining_sec": cooldown_remaining_sec(),
         },
+        "max_hold": {
+            "enabled": MAX_HOLD_ENABLED,
+            "cap_sec": MAX_HOLD_SEC,
+            "cap_hours": round(MAX_HOLD_SEC / 3600, 2) if MAX_HOLD_SEC > 0 else 0,
+            "poll_sec": MAX_HOLD_POLL_SEC,
+            "closes_total": _max_hold_closes,
+            "last_check_at": _max_hold_last_check_at,
+            "last_error": _max_hold_last_error,
+            "open_ages": {
+                c_: {
+                    "held_sec": round(time.time() - float(t_.get("entry_time", 0) or 0), 1),
+                    "held_hours": round((time.time() - float(t_.get("entry_time", 0) or 0)) / 3600, 2),
+                    "closes_in_sec": (
+                        round(MAX_HOLD_SEC - (time.time() - float(t_.get("entry_time", 0) or 0)), 1)
+                        if MAX_HOLD_SEC > 0 else None
+                    ),
+                }
+                for c_, t_ in list(active_trades.items())
+                if float(t_.get("entry_time", 0) or 0) > 0
+            },
+        },
         "loss_lock": {
             "enabled": LOSS_LOCK_ENABLED,
             "threshold_pct": LOSS_LOCK_PCT,
@@ -2419,6 +2581,10 @@ threading.Thread(target=reconcile_worker, daemon=True).start()
 
 # Start the server-owned exit ladder (self-gates on SERVER_EXITS_ENABLED ⇒ dark
 # by default). Lock-free, matching this file's design.
+threading.Thread(target=max_hold_worker, daemon=True).start()
+log.info(f"⏱ Max-hold initialized — enabled={MAX_HOLD_ENABLED}, "
+         f"cap={MAX_HOLD_SEC}s ({MAX_HOLD_SEC/3600:.2f}h), poll={MAX_HOLD_POLL_SEC}s")
+
 threading.Thread(target=server_exit_worker, daemon=True).start()
 log.info(f"🪜 Server-exit initialized — enabled={SERVER_EXITS_ENABLED}, "
          f"mode={'paper' if PAPER_MODE else 'live'}, SL={SL_PCT}%, "
