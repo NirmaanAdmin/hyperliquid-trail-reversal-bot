@@ -535,6 +535,261 @@ def target_worker():
             log.error(f"target_worker error: {e}", exc_info=True)
 
 
+# ═══════════════════════════════════════════════════════════
+#  DAILY P&L TARGET / STOP  (USDC, IST day)  — ported from server2.py
+# ═══════════════════════════════════════════════════════════
+# Measures the ACCOUNT, not the trade log. Fees and funding are debited from
+# the account, so a value DELTA is fee-inclusive by construction; slippage
+# shows up too, because the post-close read is of real money. The number this
+# tracks is the number you keep.
+#
+# BASIS (DAILY_PNL_BASIS):
+#   "wallet" (default) — banked balance, i.e. account value MINUS unrealized.
+#       ⚠ READ THIS: on CoinDCX the wallet is an INDEPENDENT API field
+#       (Available + Locked) that is genuinely blind to unrealized — verified
+#       live, pinned to ₹854710.22 across 8 consecutive polls with 2 positions
+#       open. HYPERLIQUID HAS NO SUCH FIELD. marginSummary.accountValue
+#       ALREADY INCLUDES unrealized, so get_wallet_usdt() derives the banked
+#       figure by SUBTRACTING compute_net_roe(). That is arithmetic on two
+#       separately-fetched, mark-price-dependent quantities, so it will jitter
+#       slightly with the mark instead of sitting still between settlements.
+#       It is a good approximation of realized P&L, NOT the exact transaction
+#       arithmetic it is on CoinDCX. Do not set a tight stop against it.
+#       (In PAPER_MODE it IS exact — PAPER_START_USDT + _paper_realized.)
+#   "equity" — account value including unrealized. Trips on floating gains.
+#
+# CAVEAT ON CLOSE_ON_HIT: the trip is MEASURED on the basis above, but the
+# forced close-all CREATES realized P&L out of whatever was floating. The
+# target is a floor you cross, not a number you land on. The "banked after
+# close-all" line reports what actually landed, and the difference is your
+# fees + slippage in dollars.
+#
+# DAY BOUNDARY: IST midnight, same as DAILY_CAP. On the first poll of a new
+# IST date the baseline re-snapshots and the trip clears. State persists to
+# DAILY_PNL_FILE so a mid-day restart resumes against the SAME baseline
+# instead of silently handing you a fresh day's allowance.
+#
+# ON TRIP: entries and reverses are rejected. Closes and books are NOT —
+# blocking them would orphan open positions.
+#
+# DEPOSITS AND WITHDRAWALS CORRUPT THIS MEASURE. A transfer is
+# indistinguishable from P&L in a value delta. Set DAILY_PNL_JUMP_GUARD_USDT
+# to have single-poll jumps flagged, and hit /daily-pnl/rebaseline after one.
+DAILY_PNL_ENABLED         = os.environ.get("DAILY_PNL_ENABLED", "false").lower() == "true"
+DAILY_PNL_TARGET_USDT     = float(os.environ.get("DAILY_PNL_TARGET_USDT", "0"))   # 0 = off
+DAILY_PNL_STOP_USDT       = float(os.environ.get("DAILY_PNL_STOP_USDT", "0"))     # negative, 0 = off
+DAILY_PNL_BASIS           = os.environ.get("DAILY_PNL_BASIS", "wallet").lower()
+DAILY_PNL_POLL_SEC        = float(os.environ.get("DAILY_PNL_POLL_SEC", "10"))
+DAILY_PNL_CLOSE_ON_HIT    = os.environ.get("DAILY_PNL_CLOSE_ON_HIT", "true").lower() == "true"
+DAILY_PNL_LOG_EVERY       = int(os.environ.get("DAILY_PNL_LOG_EVERY", "1"))       # 1 = every poll
+DAILY_PNL_JUMP_GUARD_USDT = float(os.environ.get("DAILY_PNL_JUMP_GUARD_USDT", "0"))
+DAILY_PNL_FILE            = os.environ.get("DAILY_PNL_FILE", "/app/data/daily_pnl_state.json")
+
+_dpnl_date          = None    # IST date the baseline belongs to
+_dpnl_baseline      = None    # account value (USDC) at first observation of that date
+_dpnl_hit           = False
+_dpnl_hit_at        = None
+_dpnl_hit_reason    = None
+_dpnl_last_value    = None
+_dpnl_last_pnl      = None
+_dpnl_peak_pnl      = None
+_dpnl_trough_pnl    = None
+_dpnl_last_check_at = None
+_dpnl_last_error    = None
+_dpnl_poll_n        = 0
+
+
+def _dpnl_read_value():
+    """Read the account value on the configured basis.
+    Returns (basis_value, wallet_usdc, unrealized_usdc); any may be None."""
+    if DAILY_PNL_BASIS == "wallet":
+        w = get_wallet_usdt()
+        return w, w, get_unrealized_usdt()
+    cur = get_current_value_usdt()
+    u   = get_unrealized_usdt()
+    w   = None if (cur is None or u is None) else cur - u
+    return cur, w, u
+
+
+def save_daily_pnl_state():
+    try:
+        os.makedirs(os.path.dirname(DAILY_PNL_FILE), exist_ok=True)
+        with open(DAILY_PNL_FILE, "w") as f:
+            json.dump({
+                "ist_date": str(_dpnl_date) if _dpnl_date else None,
+                "baseline": _dpnl_baseline,
+                "basis": DAILY_PNL_BASIS,
+                "hit": _dpnl_hit,
+                "hit_at": _dpnl_hit_at,
+                "hit_reason": _dpnl_hit_reason,
+                "peak_pnl": _dpnl_peak_pnl,
+                "trough_pnl": _dpnl_trough_pnl,
+            }, f, indent=2)
+    except Exception as e:
+        log.error(f"❌ Failed to save daily P&L state: {e}")
+
+
+def load_daily_pnl_state():
+    """Restore today's baseline after a restart. If the stored date is not
+    today (IST), the baseline is deliberately NOT restored — the worker
+    snapshots a fresh one on its first poll."""
+    global _dpnl_date, _dpnl_baseline, _dpnl_hit, _dpnl_hit_at, _dpnl_hit_reason
+    global _dpnl_peak_pnl, _dpnl_trough_pnl
+    try:
+        with open(DAILY_PNL_FILE) as f:
+            s = json.load(f)
+    except FileNotFoundError:
+        log.info(f"📆 No daily P&L file at {DAILY_PNL_FILE} — baseline snapshots on first poll")
+        return
+    except (json.JSONDecodeError, ValueError) as e:
+        log.warning(f"⚠️ Daily P&L file corrupt ({e}) — starting fresh")
+        return
+    stored_date = s.get("ist_date")
+    today = str(_current_ist_date())
+    if stored_date != today:
+        log.info(f"📆 Daily P&L state on disk is for {stored_date}, today is {today} (IST) "
+                 f"— re-baselining on first poll")
+        return
+    stored_basis = s.get("basis")
+    if stored_basis and stored_basis != DAILY_PNL_BASIS:
+        log.warning(f"⚠️ Daily P&L basis changed ({stored_basis} → {DAILY_PNL_BASIS}) "
+                    f"— discarding today's baseline, will re-snapshot")
+        return
+    _dpnl_date       = _current_ist_date()
+    _dpnl_baseline   = float(s.get("baseline") or 0) or None
+    _dpnl_hit        = bool(s.get("hit", False))
+    _dpnl_hit_at     = s.get("hit_at")
+    _dpnl_hit_reason = s.get("hit_reason")
+    _dpnl_peak_pnl   = s.get("peak_pnl")
+    _dpnl_trough_pnl = s.get("trough_pnl")
+    log.info(f"📆 Daily P&L restored for {today}: baseline ${_dpnl_baseline}, "
+             f"hit={_dpnl_hit}, basis={DAILY_PNL_BASIS}")
+
+
+def _dpnl_rollover_if_needed(value):
+    """Snapshot a new baseline when the IST date changes (or on first ever
+    poll). Returns True if a rollover happened."""
+    global _dpnl_date, _dpnl_baseline, _dpnl_hit, _dpnl_hit_at, _dpnl_hit_reason
+    global _dpnl_peak_pnl, _dpnl_trough_pnl
+    today = _current_ist_date()
+    if _dpnl_date == today and _dpnl_baseline is not None:
+        return False
+    prev_date, prev_base = _dpnl_date, _dpnl_baseline
+    _dpnl_date       = today
+    _dpnl_baseline   = value
+    _dpnl_hit        = False
+    _dpnl_hit_at     = None
+    _dpnl_hit_reason = None
+    _dpnl_peak_pnl   = 0.0
+    _dpnl_trough_pnl = 0.0
+    if prev_date is None or prev_base is None:
+        log.info(f"📆 DAILY P&L baseline set for {today} (IST): ${value:.2f} "
+                 f"[basis={DAILY_PNL_BASIS}]")
+    else:
+        log.info(f"🌅 DAILY P&L rollover {prev_date} → {today} (IST) — "
+                 f"previous day finished at ${value - prev_base:+.2f}; "
+                 f"new baseline ${value:.2f}")
+    save_daily_pnl_state()
+    return True
+
+
+def daily_pnl_blocking():
+    """True when today's USDC target/stop has tripped and new risk is barred."""
+    return DAILY_PNL_ENABLED and _dpnl_hit
+
+
+def daily_pnl_worker():
+    """Poll account value every DAILY_PNL_POLL_SEC, track P&L against the
+    IST-midnight baseline, and trip once the USDC target or stop is met."""
+    global _dpnl_last_value, _dpnl_last_pnl, _dpnl_last_check_at, _dpnl_last_error
+    global _dpnl_hit, _dpnl_hit_at, _dpnl_hit_reason
+    global _dpnl_peak_pnl, _dpnl_trough_pnl, _dpnl_poll_n
+    log.info(f"💰 Daily P&L monitor started — enabled={DAILY_PNL_ENABLED}, "
+             f"target=${DAILY_PNL_TARGET_USDT}, stop=${DAILY_PNL_STOP_USDT}, "
+             f"basis={DAILY_PNL_BASIS}, poll={DAILY_PNL_POLL_SEC}s, "
+             f"close_on_hit={DAILY_PNL_CLOSE_ON_HIT}, file={DAILY_PNL_FILE}")
+    while True:
+        try:
+            time.sleep(DAILY_PNL_POLL_SEC)
+            if not DAILY_PNL_ENABLED:
+                continue
+
+            value, wallet, unreal = _dpnl_read_value()
+            _dpnl_last_check_at = datetime.now(timezone.utc).isoformat()
+            if value is None:
+                _dpnl_last_error = "account value fetch failed"
+                continue
+            _dpnl_last_error = None
+
+            # Transfer guard — a deposit/withdrawal is indistinguishable from
+            # P&L in a value delta. Flag it loudly; the operator decides.
+            if (DAILY_PNL_JUMP_GUARD_USDT > 0 and _dpnl_last_value is not None
+                    and abs(value - _dpnl_last_value) >= DAILY_PNL_JUMP_GUARD_USDT):
+                log.warning(f"⚠️ DAILY P&L: value moved ${value - _dpnl_last_value:+.2f} in a "
+                            f"single {DAILY_PNL_POLL_SEC}s poll (guard ${DAILY_PNL_JUMP_GUARD_USDT}). "
+                            f"If that was a deposit or withdrawal, today's P&L is now wrong — "
+                            f"hit /daily-pnl/rebaseline")
+
+            _dpnl_rollover_if_needed(value)
+            _dpnl_last_value = value
+
+            pnl = value - _dpnl_baseline
+            _dpnl_last_pnl = pnl
+            if _dpnl_peak_pnl is None or pnl > _dpnl_peak_pnl:
+                _dpnl_peak_pnl = pnl
+            if _dpnl_trough_pnl is None or pnl < _dpnl_trough_pnl:
+                _dpnl_trough_pnl = pnl
+
+            _dpnl_poll_n += 1
+            if DAILY_PNL_LOG_EVERY > 0 and (_dpnl_poll_n % DAILY_PNL_LOG_EVERY == 0):
+                tgt = f"${DAILY_PNL_TARGET_USDT:.0f}" if DAILY_PNL_TARGET_USDT > 0 else "off"
+                stp = f"${DAILY_PNL_STOP_USDT:.0f}" if DAILY_PNL_STOP_USDT < 0 else "off"
+                log.info(f"💰 DAY P&L {_dpnl_date}: ${pnl:+.2f} "
+                         f"(value ${value:.2f} − base ${_dpnl_baseline:.2f}) | "
+                         f"target {tgt} / stop {stp} | "
+                         f"peak ${_dpnl_peak_pnl:+.2f} trough ${_dpnl_trough_pnl:+.2f} | "
+                         f"pos={len(active_trades)}" + (" | 🛑 TRIPPED" if _dpnl_hit else ""))
+
+            if _dpnl_hit:
+                continue
+
+            hit_reason = None
+            if DAILY_PNL_TARGET_USDT > 0 and pnl >= DAILY_PNL_TARGET_USDT:
+                hit_reason = (f"profit target reached — ${pnl:+.2f} ≥ "
+                              f"${DAILY_PNL_TARGET_USDT:.2f}")
+            elif DAILY_PNL_STOP_USDT < 0 and pnl <= DAILY_PNL_STOP_USDT:
+                hit_reason = (f"loss stop reached — ${pnl:+.2f} ≤ "
+                              f"${DAILY_PNL_STOP_USDT:.2f}")
+
+            if hit_reason:
+                _dpnl_hit        = True
+                _dpnl_hit_at     = datetime.now(timezone.utc).isoformat()
+                _dpnl_hit_reason = hit_reason
+                save_daily_pnl_state()
+                log.warning(f"🛑 DAILY P&L TRIP ({_dpnl_date} IST) — {hit_reason} — "
+                            f"entries/reverses blocked until IST midnight or /daily-pnl/reset")
+                if DAILY_PNL_CLOSE_ON_HIT and active_trades:
+                    # NOTE: HL's close_all_positions takes lock_kind=, not
+                    # lock_type= as on CoinDCX. trigger_pct=None so this does
+                    # NOT feed the DAILY_CAP percentage counter — that tracks
+                    # cumulative locked ROE, a different measure entirely.
+                    close_all_positions(
+                        trigger_reason=f"daily P&L — {hit_reason}",
+                        trigger_pct=None, lock_kind="profit")
+                    # Re-read after the close so the gap between the TRIGGER
+                    # value and the BANKED value is visible. That gap is your
+                    # fees + slippage, in dollars, which is the entire reason
+                    # this module exists.
+                    time.sleep(2.0)
+                    v2, _, _ = _dpnl_read_value()
+                    if v2 is not None:
+                        banked = v2 - _dpnl_baseline
+                        log.info(f"💰 DAILY P&L banked after close-all: ${banked:+.2f} "
+                                 f"(tripped at ${pnl:+.2f}; difference ${banked - pnl:+.2f} "
+                                 f"= fees + slippage)")
+        except Exception as e:
+            _dpnl_last_error = str(e)
+            log.error(f"daily_pnl_worker error: {e}", exc_info=True)
 # ─── Event Log ───
 trade_log = []
 MAX_LOG = 50
@@ -1693,6 +1948,20 @@ def process_signal(data, enqueued_at):
             return jsonify({"status": "rejected",
                             "reason": f"streak pause ({remaining}s)"}), 200
 
+        # ─── DAILY P&L TARGET GATE (USDC) ─────────────────────
+        # Dollar-denominated day stop. Scoped to ENTRY/REVERSE — closes and
+        # books must always pass, same reasoning as every gate above.
+        if daily_pnl_blocking() and alert_type in ("entry", "reverse"):
+            pnl_str = f"${_dpnl_last_pnl:+.2f}" if _dpnl_last_pnl is not None else "unknown"
+            log.info(f"🛑 DAILY P&L: rejecting {alert_type} for {symbol} — "
+                     f"{_dpnl_hit_reason} (now {pnl_str})")
+            log_trade_event(symbol, action, alert_type, "DAILY_PNL", _dpnl_hit_reason or "tripped")
+            return jsonify({
+                "status": "rejected",
+                "reason": f"daily P&L target reached ({_dpnl_hit_reason}); "
+                          f"resumes at IST midnight or /daily-pnl/reset"
+            }), 200
+
         # ─── PROFIT-LOCK COOLDOWN GATE ────────────────────────
         # SCOPED TO ENTRY/REVERSE — closes and books must never be blocked.
         #
@@ -2228,6 +2497,124 @@ def flatten():
                  f"{residual} still open — retry or close manually"),
     })
 
+
+@app.route("/daily-pnl/status", methods=["GET"])
+def daily_pnl_status():
+    """Read-only view of today's USDC P&L against the IST-midnight baseline."""
+    if not _secret_ok(_request_secret()):
+        return jsonify({"error": "unauthorized"}), 401
+    return jsonify({
+        "enabled": DAILY_PNL_ENABLED,
+        "basis": DAILY_PNL_BASIS,
+        "basis_note": ("wallet on Hyperliquid is DERIVED (accountValue − unrealized), "
+                       "not an independent field as on CoinDCX — it jitters with the mark"
+                       if DAILY_PNL_BASIS == "wallet" and not PAPER_MODE else None),
+        "ist_date": str(_dpnl_date) if _dpnl_date else None,
+        "ist_now": datetime.now(IST_TZ).isoformat(),
+        "baseline_usdc": _dpnl_baseline,
+        "current_value_usdc": _dpnl_last_value,
+        "pnl_today_usdc": _dpnl_last_pnl,
+        "peak_pnl_usdc": _dpnl_peak_pnl,
+        "trough_pnl_usdc": _dpnl_trough_pnl,
+        "target_usdc": DAILY_PNL_TARGET_USDT,
+        "stop_usdc": DAILY_PNL_STOP_USDT,
+        "remaining_to_target_usdc": (
+            None if (_dpnl_last_pnl is None or DAILY_PNL_TARGET_USDT <= 0)
+            else round(DAILY_PNL_TARGET_USDT - _dpnl_last_pnl, 2)
+        ),
+        "hit": _dpnl_hit,
+        "hit_at": _dpnl_hit_at,
+        "hit_reason": _dpnl_hit_reason,
+        "close_on_hit": DAILY_PNL_CLOSE_ON_HIT,
+        "poll_sec": DAILY_PNL_POLL_SEC,
+        "last_check_at": _dpnl_last_check_at,
+        "last_error": _dpnl_last_error,
+    }), 200
+
+
+@app.route("/daily-pnl/set", methods=["POST", "GET"])
+def daily_pnl_set():
+    """Change today's USDC target and/or stop without a redeploy.
+    ?target=250 and/or ?stop=-120 . Raising the target above the current P&L
+    clears the trip flag so trading resumes."""
+    global DAILY_PNL_TARGET_USDT, DAILY_PNL_STOP_USDT, _dpnl_hit, _dpnl_hit_at, _dpnl_hit_reason
+    if not _secret_ok(_request_secret()):
+        return jsonify({"error": "unauthorized"}), 401
+    old_t, old_s = DAILY_PNL_TARGET_USDT, DAILY_PNL_STOP_USDT
+    raw_t = request.args.get("target")
+    raw_s = request.args.get("stop")
+    if raw_t is None and raw_s is None:
+        return jsonify({"error": "pass ?target=N and/or ?stop=-N"}), 400
+    try:
+        if raw_t is not None:
+            DAILY_PNL_TARGET_USDT = float(raw_t)
+        if raw_s is not None:
+            DAILY_PNL_STOP_USDT = float(raw_s)
+    except ValueError:
+        return jsonify({"error": "target/stop must be numeric"}), 400
+    if DAILY_PNL_STOP_USDT > 0:
+        DAILY_PNL_STOP_USDT = old_s
+        return jsonify({"error": "stop must be negative (or 0 to disable)"}), 400
+    cleared = False
+    if _dpnl_hit and _dpnl_last_pnl is not None:
+        above_t = DAILY_PNL_TARGET_USDT <= 0 or _dpnl_last_pnl < DAILY_PNL_TARGET_USDT
+        above_s = DAILY_PNL_STOP_USDT >= 0 or _dpnl_last_pnl > DAILY_PNL_STOP_USDT
+        if above_t and above_s:
+            _dpnl_hit, _dpnl_hit_at, _dpnl_hit_reason = False, None, None
+            cleared = True
+            save_daily_pnl_state()
+    log.info(f"💰 DAILY P&L SET: target ${old_t}→${DAILY_PNL_TARGET_USDT}, "
+             f"stop ${old_s}→${DAILY_PNL_STOP_USDT}, trip_cleared={cleared}")
+    return jsonify({"status": "ok", "target_usdc": DAILY_PNL_TARGET_USDT,
+                    "stop_usdc": DAILY_PNL_STOP_USDT, "trip_cleared": cleared,
+                    "pnl_today_usdc": _dpnl_last_pnl}), 200
+
+
+@app.route("/daily-pnl/rebaseline", methods=["POST", "GET"])
+def daily_pnl_rebaseline():
+    """Re-anchor today's baseline to the CURRENT account value. Use after a
+    deposit or withdrawal — a transfer is indistinguishable from P&L in a
+    value delta, so today's number is wrong until you do this. Also clears
+    the trip flag."""
+    global _dpnl_baseline, _dpnl_date, _dpnl_hit, _dpnl_hit_at, _dpnl_hit_reason
+    global _dpnl_peak_pnl, _dpnl_trough_pnl, _dpnl_last_pnl
+    if not _secret_ok(_request_secret()):
+        return jsonify({"error": "unauthorized"}), 401
+    value, wallet, unreal = _dpnl_read_value()
+    if value is None:
+        return jsonify({"error": "account value fetch failed — try again"}), 503
+    old = _dpnl_baseline
+    _dpnl_date       = _current_ist_date()
+    _dpnl_baseline   = value
+    _dpnl_last_pnl   = 0.0
+    _dpnl_peak_pnl   = 0.0
+    _dpnl_trough_pnl = 0.0
+    _dpnl_hit, _dpnl_hit_at, _dpnl_hit_reason = False, None, None
+    save_daily_pnl_state()
+    log.warning(f"📆 DAILY P&L REBASELINE: ${old} → ${value:.2f} "
+                f"(operator-initiated; today's P&L restarts from zero)")
+    return jsonify({"status": "ok", "old_baseline_usdc": old,
+                    "new_baseline_usdc": round(value, 2),
+                    "wallet_usdc": wallet, "unrealized_usdc": unreal,
+                    "ist_date": str(_dpnl_date)}), 200
+
+
+@app.route("/daily-pnl/reset", methods=["POST", "GET"])
+def daily_pnl_reset():
+    """Clear the trip flag and resume trading today WITHOUT moving the
+    baseline. The day's P&L keeps accumulating from the same anchor, so if you
+    are still past target it will trip again on the next poll — raise the
+    target with /daily-pnl/set if that is not what you want."""
+    global _dpnl_hit, _dpnl_hit_at, _dpnl_hit_reason
+    if not _secret_ok(_request_secret()):
+        return jsonify({"error": "unauthorized"}), 401
+    was, reason = _dpnl_hit, _dpnl_hit_reason
+    _dpnl_hit, _dpnl_hit_at, _dpnl_hit_reason = False, None, None
+    save_daily_pnl_state()
+    log.info(f"💰 DAILY P&L trip manually cleared (was_hit={was}, reason={reason})")
+    return jsonify({"status": "reset", "was_hit": was, "previous_reason": reason,
+                    "pnl_today_usdc": _dpnl_last_pnl,
+                    "note": "baseline unchanged — will re-trip if still past target"}), 200
 @app.route("/daily-cap/reset", methods=["POST", "GET"])
 def daily_cap_reset():
     global _daily_locked_pct_sum, _daily_lock_count, _daily_paused, _daily_counter_date
@@ -2600,6 +2987,18 @@ if ASYNC_QUEUE_ENABLED:
     log.info(f"⚙️ Async webhook queue ENABLED — max_job_age={MAX_JOB_AGE_SEC}s")
 else:
     log.info("⚙️ Async webhook queue DISABLED — processing synchronously")
+
+load_daily_pnl_state()
+log.info(f"💰 Daily P&L initialized — enabled={DAILY_PNL_ENABLED}, "
+         f"target=${DAILY_PNL_TARGET_USDT}, stop=${DAILY_PNL_STOP_USDT}, "
+         f"basis={DAILY_PNL_BASIS}, close_on_hit={DAILY_PNL_CLOSE_ON_HIT}, "
+         f"baseline={'$%.2f' % _dpnl_baseline if _dpnl_baseline is not None else 'pending first poll'}")
+if DAILY_PNL_ENABLED and DAILY_PNL_BASIS == "wallet" and not PAPER_MODE:
+    log.warning("⚠️ Daily P&L basis=wallet on Hyperliquid is DERIVED "
+                "(accountValue − unrealized), not an independent field as on "
+                "CoinDCX. It jitters with the mark instead of sitting still "
+                "between settlements. Do not set a tight stop against it.")
+threading.Thread(target=daily_pnl_worker, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
