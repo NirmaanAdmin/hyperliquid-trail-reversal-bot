@@ -22,6 +22,7 @@ This module performs NO network I/O at import time. The SDK objects are built
 lazily on first use so the process boots even in PAPER_MODE with no key set.
 """
 
+import os
 import math
 import time
 import logging
@@ -38,7 +39,8 @@ log = logging.getLogger("bot.hyperliquid")
 class HyperliquidFutures:
     def __init__(self, account_address, secret_key, network="mainnet",
                  cross_margin=True, slippage=0.01, state_ttl=2.0,
-                 stale_max=60.0, info_retries=3, info_backoff=0.4):
+                 stale_max=60.0, info_retries=3, info_backoff=0.4,
+                 http_timeout=None):
         self.account_address = (account_address or "").strip()
         self.secret_key = (secret_key or "").strip()
         self.network = (network or "mainnet").strip().lower()
@@ -50,6 +52,22 @@ class HyperliquidFutures:
         self.stale_max = float(stale_max)
         self.info_retries = int(info_retries)     # total attempts for info calls
         self.info_backoff = float(info_backoff)   # base backoff seconds (exp)
+
+        # ── HTTP TIMEOUT — the fix for the silent worker freeze ──────────
+        # hyperliquid-python-sdk 0.23.0's API.__init__ defaults timeout=None
+        # and passes it straight to requests:
+        #     response = self.session.post(url, json=payload, timeout=self.timeout)
+        # timeout=None in requests means BLOCK FOREVER. One unresponsive socket
+        # parks the calling thread permanently — it never raises, so _retry_info
+        # never regains control and the worker's own try/except never fires.
+        # That is exactly how the ladder thread went silent for 50 minutes with
+        # last_error=null while every other worker kept polling.
+        # A float here is passed to Info/Exchange, which forward it to
+        # requests as the (connect+read) timeout, so a hang RAISES and the
+        # retry/backoff logic above can actually do its job.
+        self.http_timeout = float(
+            http_timeout if http_timeout is not None
+            else os.environ.get("HL_HTTP_TIMEOUT", "10"))
 
         self._lock = threading.Lock()
         self._info = None
@@ -83,8 +101,10 @@ class HyperliquidFutures:
         if self._info is None:
             with self._lock:
                 if self._info is None:
-                    self._info = Info(self._base_url(), skip_ws=True)
-                    log.info(f"🌐 Hyperliquid Info ready ({self.network})")
+                    self._info = Info(self._base_url(), skip_ws=True,
+                                      timeout=self.http_timeout)
+                    log.info(f"🌐 Hyperliquid Info ready ({self.network}) "
+                             f"— http_timeout={self.http_timeout}s")
         return self._info
 
     def exchange(self):
@@ -100,6 +120,7 @@ class HyperliquidFutures:
                     self._exchange = Exchange(
                         wallet, self._base_url(),
                         account_address=self.account_address,
+                        timeout=self.http_timeout,
                     )
                     log.info(f"🔑 Hyperliquid Exchange ready — agent={wallet.address} "
                              f"acting for main={self.account_address} ({self.network})")

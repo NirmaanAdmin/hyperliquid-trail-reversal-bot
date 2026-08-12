@@ -2327,6 +2327,18 @@ def status():
             "open": len(active_trades),
             "at_cap": (MAX_POSITIONS > 0 and len(active_trades) >= MAX_POSITIONS),
         },
+        "watchdog": {
+            "enabled": WATCHDOG_ENABLED,
+            "check_sec": WATCHDOG_CHECK_SEC,
+            "stale_mult": WATCHDOG_STALE_MULT,
+            "min_stale_sec": WATCHDOG_MIN_STALE,
+            "restarts": dict(_wd_restarts),
+            "last_restart_at": dict(_wd_last_restart),
+            "heartbeat_age_sec": {
+                n: (None if _wd_age(hb) is None else round(_wd_age(hb), 1))
+                for n, hb, _p, _t, _a in _wd_specs()
+            },
+        },
         "server_exits": {
             "enabled": SERVER_EXITS_ENABLED,
             "phase": "full_ladder",
@@ -2949,6 +2961,102 @@ log.info(f"📐 Baseline initialized — enabled={BASELINE_ENABLED}, "
          f"current={_baseline_usdt if _baseline_usdt is not None else 'unset'} USDC, "
          f"trigger={BASELINE_TRIGGER_PCT}%, rollover={BASELINE_ROLLOVER_PCT}%")
 
+# ═══════════════════════════════════════════════════════════
+#  WORKER WATCHDOG — makes a wedged thread RECOVERABLE
+# ═══════════════════════════════════════════════════════════
+# A timeout stops the common cause of a freeze; it does not stop every cause.
+# A thread can still be lost to an SDK-internal retry loop, a DNS hang below
+# the socket layer, or a bug in a step handler. When that happens the thread
+# never reaches its own try/except, so last_error stays null and the only
+# symptom is a stale last_check_at — which is what happened to the ladder for
+# 50 minutes while positions sat unmonitored.
+#
+# This supervises the workers that hold real risk, by the only evidence that
+# survives a wedge: whether their heartbeat is advancing. If one goes stale by
+# more than WATCHDOG_STALE_MULT × its poll interval, the thread is presumed
+# dead and a REPLACEMENT is started.
+#
+# The dead thread is NOT killed — Python cannot safely kill a thread blocked in
+# a syscall. It is abandoned; if it ever unblocks it either exits or does one
+# redundant, idempotent pass. Both closers are reduce-only and sized from the
+# real position, so a duplicate pass can only over-reduce, never open exposure
+# — the same argument the ladder's own lock-free design already rests on.
+#
+# Set WATCHDOG_ENABLED=false to disable. Restarts are logged loudly and
+# counted in /status so a silently-flapping worker is visible rather than
+# looking healthy.
+WATCHDOG_ENABLED     = os.environ.get("WATCHDOG_ENABLED", "true").lower() == "true"
+WATCHDOG_CHECK_SEC   = float(os.environ.get("WATCHDOG_CHECK_SEC", "30"))
+WATCHDOG_STALE_MULT  = float(os.environ.get("WATCHDOG_STALE_MULT", "10"))
+WATCHDOG_MIN_STALE   = float(os.environ.get("WATCHDOG_MIN_STALE", "60"))
+
+_wd_restarts = {}      # name -> count
+_wd_last_restart = {}  # name -> iso ts
+
+
+def _wd_age(iso_ts):
+    """Seconds since an ISO heartbeat, or None if it has never ticked."""
+    if not iso_ts:
+        return None
+    try:
+        t = datetime.fromisoformat(iso_ts)
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - t).total_seconds()
+    except Exception:
+        return None
+
+
+def _wd_specs():
+    """(name, heartbeat, poll_sec, target, is_armed) for each supervised worker.
+    Read fresh each pass so the heartbeats are current globals, and so a worker
+    that is disabled or idle is not treated as wedged."""
+    return [
+        ("server_exit", _server_exit_last_check_at, EXIT_POLL_SEC,
+         server_exit_worker, SERVER_EXITS_ENABLED and bool(active_trades)),
+        ("max_hold", _max_hold_last_check_at, MAX_HOLD_POLL_SEC,
+         max_hold_worker, MAX_HOLD_ENABLED and bool(active_trades)),
+        ("daily_pnl", _dpnl_last_check_at, DAILY_PNL_POLL_SEC,
+         daily_pnl_worker, DAILY_PNL_ENABLED),
+        ("target", _target_last_check_at, TARGET_POLL_SEC,
+         target_worker, TARGET_ENABLED and _target_value > 0),
+    ]
+
+
+def watchdog_worker():
+    log.info(f"🐕 Watchdog started — enabled={WATCHDOG_ENABLED}, "
+             f"check={WATCHDOG_CHECK_SEC}s, stale=max({WATCHDOG_STALE_MULT}×poll, "
+             f"{WATCHDOG_MIN_STALE}s)")
+    while True:
+        try:
+            time.sleep(WATCHDOG_CHECK_SEC)
+            if not WATCHDOG_ENABLED:
+                continue
+            for name, hb, poll, target, armed in _wd_specs():
+                if not armed:
+                    continue
+                age = _wd_age(hb)
+                if age is None:
+                    continue          # never ticked yet — starting up, not wedged
+                limit = max(float(poll) * WATCHDOG_STALE_MULT, WATCHDOG_MIN_STALE)
+                if age <= limit:
+                    continue
+                _wd_restarts[name] = _wd_restarts.get(name, 0) + 1
+                _wd_last_restart[name] = datetime.now(timezone.utc).isoformat()
+                log.error(f"🐕 WATCHDOG: '{name}' heartbeat {age:.0f}s stale "
+                          f"(limit {limit:.0f}s, poll {poll}s) — thread presumed "
+                          f"WEDGED. Starting a replacement. This is the silent-freeze "
+                          f"failure: positions were unmonitored for {age:.0f}s. "
+                          f"Restart #{_wd_restarts[name]} for this worker.")
+                try:
+                    threading.Thread(target=target, daemon=True).start()
+                except Exception as e:
+                    log.error(f"🐕 WATCHDOG: failed to restart '{name}': {e}",
+                              exc_info=True)
+        except Exception as e:
+            log.error(f"watchdog error: {e}", exc_info=True)
+
+
 threading.Thread(target=profit_lock_worker, daemon=True).start()
 threading.Thread(target=baseline_worker, daemon=True).start()
 threading.Thread(target=sl_lockout_worker, daemon=True).start()
@@ -2999,6 +3107,9 @@ if DAILY_PNL_ENABLED and DAILY_PNL_BASIS == "wallet" and not PAPER_MODE:
                 "CoinDCX. It jitters with the mark instead of sitting still "
                 "between settlements. Do not set a tight stop against it.")
 threading.Thread(target=daily_pnl_worker, daemon=True).start()
+
+# Watchdog LAST — every worker it supervises must already be running.
+threading.Thread(target=watchdog_worker, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
