@@ -1004,10 +1004,28 @@ def _maybe_resume_after_streak_pause():
 def close_all_positions(trigger_reason="profit lock", trigger_pct=None, lock_kind="manual"):
     """Close every position in active_trades via market order, clear state,
     and activate the post-lock cooldown. Bumps the daily counter if trigger_pct
-    is provided."""
-    global _profit_lock_until
+    is provided.
+
+    lock_kind="flatten" (scheduled daily flatten) arms its own short cooldown
+    (_flatten_until) instead of the profit-lock cooldown, and does not touch
+    the streak counter or daily cap."""
+    global _profit_lock_until, _flatten_until
     snapshot = list(active_trades.items())
-    log.info(f"🔒 LOCK triggered ({trigger_reason}) — closing {len(snapshot)} positions")
+    _is_flatten = (lock_kind == "flatten")
+    _hdr = "⏰ DAILY FLATTEN" if _is_flatten else "🔒 LOCK"
+    log.info(f"{_hdr} triggered ({trigger_reason}) — closing {len(snapshot)} positions")
+
+    # ─── ARM COOLDOWN IMMEDIATELY ────────────────────────────
+    # Parity with server2.py (CoinDCX). The cooldown used to be armed at the
+    # END, after every close + the residual sweep — seconds later. Entries that
+    # landed in that window passed the gate and reopened positions (CoinDCX
+    # incident 2026-05-29: FET and 1000BONK reopened mid-lock). The signal
+    # worker runs concurrently with this function, so the same window exists
+    # here. Arming first makes the gate reject from the instant the lock fires.
+    if _is_flatten:
+        _flatten_until = time.time() + DAILY_FLATTEN_COOLDOWN_SEC
+    else:
+        _profit_lock_until = time.time() + COOLDOWN_AFTER_LOCK_SEC
     mids = client.all_mids() if PAPER_MODE else {}
     for coin, trade in snapshot:
         try:
@@ -1023,7 +1041,9 @@ def close_all_positions(trigger_reason="profit lock", trigger_pct=None, lock_kin
             if PAPER_MODE:
                 exit_px = mids.get(coin) or trade.get("entry_price")
                 record_realized(coin, trade.get("entry_price"), exit_px, close_qty, trade.get("side"))
-            log_trade_event(coin, _close_side(trade), "profit_lock", "FILLED", trigger_reason)
+            log_trade_event(coin, _close_side(trade),
+                            "daily_flatten" if _is_flatten else "profit_lock",
+                            "FILLED", trigger_reason)
         except Exception as e:
             log.error(f"❌ Lock close exception for {coin}: {e}", exc_info=True)
     for coin in list(native_sl_orders.keys()):
@@ -1036,8 +1056,9 @@ def close_all_positions(trigger_reason="profit lock", trigger_pct=None, lock_kin
     residual = _sweep_residual_positions()
     active_trades.clear()
     _save_active_trades()
-    _profit_lock_until = time.time() + COOLDOWN_AFTER_LOCK_SEC
-    cooldown_end = datetime.fromtimestamp(_profit_lock_until).strftime("%H:%M:%S")
+    # Cooldown was armed at the top (see ARM COOLDOWN IMMEDIATELY).
+    cooldown_end = datetime.fromtimestamp(
+        _flatten_until if _is_flatten else _profit_lock_until, IST_TZ).strftime("%H:%M:%S IST")
     if residual == 0:
         log.info(f"✅ LOCK complete — all positions closed (swept flat), cooldown until {cooldown_end}")
     elif residual is None:
@@ -1095,6 +1116,167 @@ def in_profit_lock_cooldown():
 
 def cooldown_remaining_sec():
     return max(0, int(_profit_lock_until - time.time()))
+
+
+# ═══════════════════════════════════════════════════════════
+#  DAILY AUTO-FLATTEN — close everything once a day at a fixed IST time
+#  Parity with server2.py (CoinDCX).
+#
+#  At DAILY_FLATTEN_TIME (HH:MM or HH:MM:SS, IST) every position is closed via
+#  close_all_positions(lock_kind="flatten"): tracked positions, then the
+#  residual sweep for anything else open on the exchange. After the flatten,
+#  ENTRY and REVERSE are rejected for DAILY_FLATTEN_COOLDOWN_SEC so in-flight
+#  Pine alerts can't reopen mid-close. CLOSE and BOOK always pass.
+#
+#  Does NOT touch the streak counter, daily cap or profit-lock cooldown.
+#  Fires at most once per IST date (persisted to DAILY_FLATTEN_FILE). If the
+#  process was down at the scheduled time it still fires on boot when no more
+#  than DAILY_FLATTEN_GRACE_SEC late; beyond that the day is marked "missed".
+#  Env vars are read at process start — Railway Redeploy after changing them.
+# ═══════════════════════════════════════════════════════════
+DAILY_FLATTEN_ENABLED      = os.environ.get("DAILY_FLATTEN_ENABLED", "true").lower() == "true"
+DAILY_FLATTEN_TIME         = os.environ.get("DAILY_FLATTEN_TIME", "10:29").strip()
+DAILY_FLATTEN_COOLDOWN_SEC = int(os.environ.get("DAILY_FLATTEN_COOLDOWN_SEC", "60"))
+DAILY_FLATTEN_GRACE_SEC    = int(os.environ.get("DAILY_FLATTEN_GRACE_SEC", "300"))
+DAILY_FLATTEN_POLL_SEC     = float(os.environ.get("DAILY_FLATTEN_POLL_SEC", "5"))
+DAILY_FLATTEN_FILE         = os.environ.get("DAILY_FLATTEN_FILE", "/app/data/daily_flatten_state.json")
+
+_flatten_until          = 0.0
+_flatten_last_date      = None
+_flatten_last_result    = None
+_flatten_last_at        = None
+_flatten_last_closed    = None
+_flatten_last_error     = None
+_flatten_last_check_at  = None   # watchdog heartbeat
+_flatten_count          = 0
+
+
+def _parse_flatten_time(s):
+    try:
+        parts = [int(p) for p in s.split(":")]
+    except (ValueError, AttributeError):
+        return None
+    if len(parts) == 2:
+        parts.append(0)
+    if len(parts) != 3:
+        return None
+    h, m, sec = parts
+    if not (0 <= h <= 23 and 0 <= m <= 59 and 0 <= sec <= 59):
+        return None
+    return h, m, sec
+
+
+_FLATTEN_HMS = _parse_flatten_time(DAILY_FLATTEN_TIME)
+if DAILY_FLATTEN_ENABLED and _FLATTEN_HMS is None:
+    log.error(f"❌ DAILY_FLATTEN_TIME='{DAILY_FLATTEN_TIME}' is not HH:MM[:SS] — daily flatten DISABLED")
+    DAILY_FLATTEN_ENABLED = False
+
+
+def _flatten_target_today(now_ist):
+    h, m, sec = _FLATTEN_HMS
+    return now_ist.replace(hour=h, minute=m, second=sec, microsecond=0)
+
+
+def _flatten_next_fire_ist():
+    if not DAILY_FLATTEN_ENABLED or _FLATTEN_HMS is None:
+        return None
+    now = datetime.now(IST_TZ)
+    t = _flatten_target_today(now)
+    if t <= now or _flatten_last_date == str(now.date()):
+        t = t + timedelta(days=1)
+    return t.isoformat()
+
+
+def in_flatten_cooldown():
+    return time.time() < _flatten_until
+
+
+def flatten_cooldown_remaining_sec():
+    return max(0, int(_flatten_until - time.time()))
+
+
+def save_daily_flatten_state():
+    try:
+        os.makedirs(os.path.dirname(DAILY_FLATTEN_FILE), exist_ok=True)
+        with open(DAILY_FLATTEN_FILE, "w") as f:
+            json.dump({"last_date": _flatten_last_date, "last_result": _flatten_last_result,
+                       "last_at": _flatten_last_at, "last_closed": _flatten_last_closed}, f, indent=2)
+    except Exception as e:
+        log.error(f"❌ Failed to save daily flatten state: {e}")
+
+
+def load_daily_flatten_state():
+    global _flatten_last_date, _flatten_last_result, _flatten_last_at, _flatten_last_closed
+    try:
+        with open(DAILY_FLATTEN_FILE) as f:
+            s = json.load(f)
+    except FileNotFoundError:
+        return
+    except (json.JSONDecodeError, ValueError) as e:
+        log.warning(f"⚠️ Daily flatten file corrupt ({e}) — starting fresh")
+        return
+    _flatten_last_date   = s.get("last_date")
+    _flatten_last_result = s.get("last_result")
+    _flatten_last_at     = s.get("last_at")
+    _flatten_last_closed = s.get("last_closed")
+
+
+def run_daily_flatten(reason):
+    """Flatten everything now. Used by the scheduler and /daily-flatten/force."""
+    global _flatten_last_at, _flatten_last_closed, _flatten_count
+    syms = set(active_trades.keys())
+    if not PAPER_MODE:
+        try:
+            for p in (client.positions_live(force=True) or []):
+                if p.get("coin") and float(p.get("qty") or 0) > 0:
+                    syms.add(p["coin"])
+        except Exception as e:
+            log.warning(f"⏰ flatten: live position read failed ({e}) — sweep will still run")
+    syms = sorted(syms)
+    log.warning(f"⏰ DAILY FLATTEN ({reason}) — {len(syms)} open: {syms}")
+    close_all_positions(trigger_reason=reason, trigger_pct=None, lock_kind="flatten")
+    _flatten_last_at     = datetime.now(timezone.utc).isoformat()
+    _flatten_last_closed = syms
+    _flatten_count      += 1
+    return syms
+
+
+def daily_flatten_worker():
+    global _flatten_last_date, _flatten_last_result, _flatten_last_error, _flatten_last_check_at
+    log.info(f"⏰ Daily flatten scheduler started — enabled={DAILY_FLATTEN_ENABLED}, "
+             f"time={DAILY_FLATTEN_TIME} IST, cooldown={DAILY_FLATTEN_COOLDOWN_SEC}s, "
+             f"grace={DAILY_FLATTEN_GRACE_SEC}s, next={_flatten_next_fire_ist()}")
+    while True:
+        try:
+            time.sleep(DAILY_FLATTEN_POLL_SEC)
+            _flatten_last_check_at = datetime.now(timezone.utc).isoformat()
+            if not DAILY_FLATTEN_ENABLED:
+                continue
+            now = datetime.now(IST_TZ)
+            today = str(now.date())
+            if _flatten_last_date == today:
+                continue
+            late = (now - _flatten_target_today(now)).total_seconds()
+            if late < 0:
+                continue
+            if late > DAILY_FLATTEN_GRACE_SEC:
+                _flatten_last_date, _flatten_last_result = today, "missed"
+                save_daily_flatten_state()
+                log.warning(f"⏰ DAILY FLATTEN missed for {today} — process was not running at "
+                            f"{DAILY_FLATTEN_TIME} IST ({late:.0f}s late > grace "
+                            f"{DAILY_FLATTEN_GRACE_SEC}s). Nothing closed; use /daily-flatten/force if needed")
+                continue
+            # Claim the date BEFORE closing: the watchdog may start a second
+            # copy of this thread, and two copies must not both fire.
+            _flatten_last_date, _flatten_last_result = today, "firing"
+            run_daily_flatten(f"daily flatten {DAILY_FLATTEN_TIME} IST"
+                              + (f" ({late:.0f}s late)" if late > DAILY_FLATTEN_POLL_SEC * 2 else ""))
+            _flatten_last_result = "fired"
+            save_daily_flatten_state()
+            _flatten_last_error = None
+        except Exception as e:
+            _flatten_last_error = str(e)
+            log.error(f"daily_flatten_worker error: {e}", exc_info=True)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1858,6 +2040,25 @@ def webhook():
     if not data.get("symbol", ""):
         return jsonify({"status": "rejected", "reason": "missing symbol"}), 200
 
+    # ─── LABELED GATE — reject unlabeled (resync/ghost) ENTRIES ─────────────
+    # Parity with server2.py (CoinDCX, commit fc69d2a). Entry-only Pine stamps
+    # every entry with "labeled":"1" when the chart label drew on that bar and
+    # "0" when it did not (the resync catch-up path fires an entry WITHOUT a
+    # label — the ghost-entry class). Reject entries explicitly marked "0".
+    # ALLOW-IF-ABSENT: entries with no `labeled` field still pass, so alerts not
+    # yet recreated on the labeled-flag Pine keep working. Entry-only: book,
+    # close and reverse are never gated. Runs BEFORE the queue, so a ghost never
+    # occupies a worker slot.
+    if (data.get("type", "entry").lower() == "entry"
+            and str(data.get("labeled", "1")) == "0"):
+        _lg_sym = coin_from_symbol(data.get("symbol", ""))
+        log.info(f"🏷️ UNLABELED entry rejected: {_lg_sym} {data.get('action', '')} "
+                 f"(resync/ghost — no chart label)")
+        log_trade_event(_lg_sym, data.get("action", "").lower(), "entry", "UNLABELED",
+                        "no chart label")
+        return jsonify({"status": "rejected",
+                        "reason": "unlabeled entry (no chart label)"}), 200
+
     if ASYNC_QUEUE_ENABLED:
         _signal_queue.put((data, time.time()))
         depth = _signal_queue.qsize()
@@ -1961,6 +2162,15 @@ def process_signal(data, enqueued_at):
                 "reason": f"daily P&L target reached ({_dpnl_hit_reason}); "
                           f"resumes at IST midnight or /daily-pnl/reset"
             }), 200
+
+        # ─── DAILY FLATTEN COOLDOWN GATE ──────────────────────
+        # Short block after the scheduled daily flatten so in-flight Pine
+        # entries can't reopen mid-close. CLOSE and BOOK always pass.
+        if in_flatten_cooldown() and alert_type in ("entry", "reverse"):
+            remaining = flatten_cooldown_remaining_sec()
+            log.info(f"⏰ FLATTEN COOLDOWN: rejecting {alert_type} for {symbol} — {remaining}s left")
+            log_trade_event(symbol, action, alert_type, "FLATTEN_COOLDOWN", f"{remaining}s remaining")
+            return jsonify({"status": "rejected", "reason": f"daily-flatten cooldown ({remaining}s)"}), 200
 
         # ─── PROFIT-LOCK COOLDOWN GATE ────────────────────────
         # SCOPED TO ENTRY/REVERSE — closes and books must never be blocked.
@@ -2184,6 +2394,21 @@ def process_signal(data, enqueued_at):
 
         # ─── REVERSE ──────────────────────────────────────────
         elif alert_type == "reverse":
+            # ─── UNTRACKED GUARD — reverse is a strict flip-only op ──────
+            # Parity with server2.py (CoinDCX, commit a65a00c). A reverse with
+            # nothing to flip used to fall through and OPEN a fresh position,
+            # bypassing the POSITION CAP. Pine fires a plain `entry` ~1 bar after
+            # every reverse, and that path re-checks the cap and the
+            # already-tracked skip itself — so an untracked reverse is a no-op.
+            if symbol not in active_trades:
+                log.info(f"↩️ REVERSE on untracked {symbol} — nothing to flip, "
+                         f"no-op. Pine's follow-up entry webhook will open it "
+                         f"if the position cap allows.")
+                log_trade_event(symbol, action, "reverse", "SKIP",
+                                "untracked — no position to flip")
+                return jsonify({"status": "skipped",
+                                "reason": f"reverse on untracked {symbol} — "
+                                          f"no position to flip"}), 200
             cancel_native_sl(symbol)
             if symbol in active_trades:
                 trade = active_trades[symbol]
@@ -2415,6 +2640,22 @@ def status():
             "pause_remaining_sec": streak_pause_remaining_sec(),
             "pause_sec": STREAK_PAUSE_SEC,
             "last_lock_at": _streak_last_lock_at,
+        },
+        "daily_flatten": {
+            "enabled": DAILY_FLATTEN_ENABLED,
+            "time_ist": DAILY_FLATTEN_TIME,
+            "next_fire_ist": _flatten_next_fire_ist(),
+            "cooldown_sec": DAILY_FLATTEN_COOLDOWN_SEC,
+            "grace_sec": DAILY_FLATTEN_GRACE_SEC,
+            "in_cooldown": in_flatten_cooldown(),
+            "cooldown_remaining_sec": flatten_cooldown_remaining_sec(),
+            "last_date": _flatten_last_date,
+            "last_result": _flatten_last_result,
+            "last_at": _flatten_last_at,
+            "last_closed": _flatten_last_closed,
+            "fires_since_boot": _flatten_count,
+            "last_check_at": _flatten_last_check_at,
+            "last_error": _flatten_last_error,
         },
         "time": datetime.now().isoformat()
     })
@@ -2935,6 +3176,35 @@ def streak_reset():
     }), 200
 
 
+@app.route("/daily-flatten/status", methods=["GET"])
+def daily_flatten_status():
+    if not _secret_ok(_request_secret()):
+        return jsonify({"error": "unauthorized"}), 401
+    return jsonify({
+        "enabled": DAILY_FLATTEN_ENABLED,
+        "time_ist": DAILY_FLATTEN_TIME,
+        "ist_now": datetime.now(IST_TZ).isoformat(),
+        "next_fire_ist": _flatten_next_fire_ist(),
+        "in_cooldown": in_flatten_cooldown(),
+        "cooldown_remaining_sec": flatten_cooldown_remaining_sec(),
+        "last_date": _flatten_last_date,
+        "last_result": _flatten_last_result,
+        "last_at": _flatten_last_at,
+        "last_closed": _flatten_last_closed,
+        "last_error": _flatten_last_error,
+    }), 200
+
+
+@app.route("/daily-flatten/force", methods=["POST", "GET"])
+def daily_flatten_force():
+    """Run the daily flatten right now (does not affect today's scheduled fire)."""
+    if not _secret_ok(_request_secret()):
+        return jsonify({"error": "unauthorized"}), 401
+    syms = run_daily_flatten("manual /daily-flatten/force")
+    return jsonify({"status": "flattened", "symbols": syms,
+                    "cooldown_remaining_sec": flatten_cooldown_remaining_sec()}), 200
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "mode": "paper" if PAPER_MODE else "live",
@@ -3020,6 +3290,8 @@ def _wd_specs():
          daily_pnl_worker, DAILY_PNL_ENABLED),
         ("target", _target_last_check_at, TARGET_POLL_SEC,
          target_worker, TARGET_ENABLED and _target_value > 0),
+        ("daily_flatten", _flatten_last_check_at, DAILY_FLATTEN_POLL_SEC,
+         daily_flatten_worker, DAILY_FLATTEN_ENABLED),
     ]
 
 
@@ -3107,6 +3379,12 @@ if DAILY_PNL_ENABLED and DAILY_PNL_BASIS == "wallet" and not PAPER_MODE:
                 "CoinDCX. It jitters with the mark instead of sitting still "
                 "between settlements. Do not set a tight stop against it.")
 threading.Thread(target=daily_pnl_worker, daemon=True).start()
+
+# Daily auto-flatten scheduler (self-gates on DAILY_FLATTEN_ENABLED).
+load_daily_flatten_state()
+log.info(f"⏰ Daily flatten initialized — enabled={DAILY_FLATTEN_ENABLED}, "
+         f"time={DAILY_FLATTEN_TIME} IST, last={_flatten_last_date} ({_flatten_last_result})")
+threading.Thread(target=daily_flatten_worker, daemon=True).start()
 
 # Watchdog LAST — every worker it supervises must already be running.
 threading.Thread(target=watchdog_worker, daemon=True).start()
