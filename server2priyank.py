@@ -267,7 +267,63 @@ def round_down_quantity(coin, qty):
 # ═══════════════════════════════════════════════════════════
 # {coin: {pair, side, qty, original_qty, entry_price, entry_time,
 #         order_id, tp_price, sl_price, books_done, leverage, margin_ccy}}
-active_trades = {}
+
+# ─── FLAT-ONLY ENTRIES — the server, not Pine, decides "am I flat?" ───────────
+# Parity with server2.py (CoinDCX). A flat-to-enter Pine bot decides which
+# signals to take from its SIMULATED position. Every TradingView runtime (the
+# chart, each alert) simulates from its own first bar, so two runtimes can
+# disagree about whether the bot is flat — an alert opens a trade the chart shows
+# no label for. FIX: Pine sends EVERY signal with "flat_only":"1" and the time the
+# setup formed ("setup_time", epoch ms). The server applies the bot's two rules to
+# its REAL book:
+#   A. no entry while this coin is held — on EITHER side (never a flip);
+#   B. the setup must have formed AFTER this coin's last exit, i.e. while the
+#      server was flat (a setup that formed during a trade is ignored, not queued).
+# Alerts that do not send flat_only are untouched — same-side skip, opposite-side
+# flip, exactly as before.
+# Rule B needs the time each coin left the book. Rather than tag every close path
+# (ladder, profit lock, daily flatten, reconcile, manual), the book records it
+# itself: any removal from active_trades stamps _symbol_last_exit.
+# In-memory only: after a restart rule B has nothing to compare against until the
+# next exit, and passes (fail-open). A setup lives at most "Max bars to wait" bars,
+# so the gap is short.
+FLAT_ONLY_SETUP_CHECK = os.environ.get("FLAT_ONLY_SETUP_CHECK", "true").lower() == "true"
+_symbol_last_exit = {}          # {coin: unix seconds when it last left active_trades}
+_flat_only_skips = {"held": 0, "stale_setup": 0}
+
+
+class _TrackedTrades(dict):
+    """A plain dict that also stamps _symbol_last_exit whenever a coin is removed."""
+
+    @staticmethod
+    def _stamp(key):
+        try:
+            _symbol_last_exit[key] = time.time()
+        except Exception:
+            pass
+
+    def pop(self, key, *default):
+        if key in self:
+            self._stamp(key)
+        return dict.pop(self, key, *default)
+
+    def __delitem__(self, key):
+        if key in self:
+            self._stamp(key)
+        dict.__delitem__(self, key)
+
+    def popitem(self):
+        key, value = dict.popitem(self)
+        self._stamp(key)
+        return key, value
+
+    def clear(self):
+        for key in list(self.keys()):
+            self._stamp(key)
+        dict.clear(self)
+
+
+active_trades = _TrackedTrades()
 
 ACTIVE_TRADES_FILE = os.environ.get("ACTIVE_TRADES_FILE", "/app/data/active_trades.json")
 
@@ -2110,6 +2166,13 @@ def process_signal(data, enqueued_at):
         sl_price = float(data.get("sl_price", 0)) if data.get("sl_price") else None
         book_pct = float(data.get("book_pct", 33)) / 100
 
+        # Flat-only entry fields (see FLAT-ONLY ENTRIES near active_trades).
+        flat_only = str(data.get("flat_only", "0")).strip().lower() in ("1", "true", "yes")
+        try:
+            setup_ms = int(float(data.get("setup_time") or 0))
+        except (TypeError, ValueError, OverflowError):
+            setup_ms = 0
+
         if action not in ("buy", "sell"):
             return jsonify({"status": "rejected", "reason": "invalid action"}), 200
         if not symbol:
@@ -2220,6 +2283,43 @@ def process_signal(data, enqueued_at):
 
         # ─── ENTRY ────────────────────────────────────────────
         if alert_type == "entry":
+            # ─── FLAT-ONLY GATE ───────────────────────────────────
+            # Only for entries that ask for it. Rule A: held on either side →
+            # skip (no stacking, no flip). Rule B: setup formed at or before this
+            # coin's last exit → skip. The serial signal_worker means the book
+            # cannot change under another webhook between the check and the order.
+            if flat_only:
+                held = active_trades.get(symbol)
+                if held is not None:
+                    mins = int((time.time() - float(held.get("entry_time", 0) or 0)) // 60)
+                    _flat_only_skips["held"] += 1
+                    log.info(f"🚫 SKIP flat-only entry: {symbol} {action.upper()} — "
+                             f"holding {str(held.get('side', '?')).upper()} ({mins}m)")
+                    log_trade_event(symbol, action, "entry", "SKIP",
+                                    f"flat-only: holding {held.get('side', '?')} ({mins}m)")
+                    return jsonify({"status": "skipped",
+                                    "reason": f"flat-only: {symbol} already held "
+                                              f"({held.get('side', '?')})"}), 200
+                last_exit = _symbol_last_exit.get(symbol)
+                if FLAT_ONLY_SETUP_CHECK and last_exit and setup_ms > 0:
+                    now_ms = time.time() * 1000.0
+                    if setup_ms > now_ms + 60_000 or setup_ms < 1_000_000_000_000:
+                        # In the future, or not epoch MILLISECONDS at all (seconds,
+                        # a bar count, garbage) — do not act on it.
+                        log.warning(f"⚠️ flat-only: implausible setup_time {setup_ms} "
+                                    f"for {symbol} — rule B not applied")
+                    elif setup_ms <= last_exit * 1000.0:
+                        before_s = (last_exit * 1000.0 - setup_ms) / 1000.0
+                        _flat_only_skips["stale_setup"] += 1
+                        log.info(f"🚫 SKIP flat-only entry: {symbol} {action.upper()} — "
+                                 f"setup formed {before_s:.1f}s before the last exit "
+                                 f"(while the position was still open)")
+                        log_trade_event(symbol, action, "entry", "SKIP",
+                                        f"flat-only: setup {before_s:.1f}s before last exit")
+                        return jsonify({"status": "skipped",
+                                        "reason": "flat-only: setup formed before the "
+                                                  "last exit"}), 200
+
             if symbol in active_trades:
                 trade = active_trades[symbol]
                 # ─── SKIP unless this is a flip on the new architecture ───
@@ -2656,6 +2756,16 @@ def status():
             "fires_since_boot": _flatten_count,
             "last_check_at": _flatten_last_check_at,
             "last_error": _flatten_last_error,
+        },
+        "flat_only": {
+            "supported": True,
+            "setup_check": FLAT_ONLY_SETUP_CHECK,
+            "skips_held": _flat_only_skips["held"],
+            "skips_stale_setup": _flat_only_skips["stale_setup"],
+            "last_exit_age_sec": {
+                s_: round(time.time() - ts_, 1)
+                for s_, ts_ in list(_symbol_last_exit.items())
+            },
         },
         "time": datetime.now().isoformat()
     })
