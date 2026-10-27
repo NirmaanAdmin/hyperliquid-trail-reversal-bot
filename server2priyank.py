@@ -162,6 +162,19 @@ EXIT_POLL_SEC        = int(os.environ.get("EXIT_POLL_SEC", "5"))     # ladder po
 # Per-cycle heartbeat: when true, every armed coin logs mark/avg/prof%/k/books/sl
 # each poll so the ladder's view is observable live instead of inferred.
 LADDER_VERBOSE       = os.environ.get("LADDER_VERBOSE", "false").lower() == "true"
+# Exit mode (used when SERVER_EXITS_ENABLED) — same contract as the CoinDCX server2:
+#   single (default) — ONE take-profit: when price has moved TP_PCT % in the trade's
+#                      favour off the REAL avg fill (all_mids mark), close the WHOLE
+#                      position reduce-only. No books, no rungs, no trailing. The
+#                      stop stays at the initial SL_PCT level (SL_PCT=0 → no stop).
+#   ladder           — the original rung ladder (TP_STEP_PCT / BOOK_PCT / MAX_BOOKS).
+# TP_PCT is a PRICE %, not ROE: 4% at 5x leverage ≈ +20% on margin.
+EXIT_MODE            = os.environ.get("EXIT_MODE", "single").strip().lower()
+TP_PCT               = float(os.environ.get("TP_PCT", "4.0"))
+
+
+def _fmt_px(x):
+    return "off" if x is None else f"{float(x):.8f}"
 
 # Ladder runtime state (read by /status)
 _server_exit_closes        = 0
@@ -1688,8 +1701,9 @@ def cancel_native_sl(coin):
 #  Ported verbatim-in-math from the validated CoinDCX ladder.
 # ═══════════════════════════════════════════════════════════
 def _sl_level(side, entry):
-    """Static initial SL price: entry ∓ SL_PCT. Long stop below, short above."""
-    if not entry or entry <= 0:
+    """Static initial SL price: entry ∓ SL_PCT. Long stop below, short above.
+    SL_PCT <= 0 → no server stop (None) — never a stop AT entry."""
+    if not entry or entry <= 0 or SL_PCT <= 0:
         return None
     if side == "buy":
         return entry * (1.0 - SL_PCT / 100.0)
@@ -1825,7 +1839,11 @@ def _ladder_step(coin, pos, mark):
         trade["entry_price"]     = avg          # keep human-visible entry honest
         _save_active_trades()
         log.info(f"🪜 LADDER armed: {coin} {side.upper()} avg={avg} qty={qty_abs} "
-                 f"SL0={trade['ladder_sl']:.8f} (−{SL_PCT}% / +{SL_PCT}%)")
+                 f"SL0={_fmt_px(trade['ladder_sl'])} (−{SL_PCT}% / +{SL_PCT}%) "
+                 f"exit_mode={EXIT_MODE}"
+                 + (f" TP={TP_PCT}% → "
+                    f"{avg * (1 + TP_PCT / 100.0) if side == 'buy' else avg * (1 - TP_PCT / 100.0):.8f}"
+                    if EXIT_MODE != "ladder" else ""))
 
     # ── 2. SIDE-CONSISTENCY GUARD (lock-free safety) ──────
     # A flip (close+reopen opposite) can land between the fetch and now. If the
@@ -1838,7 +1856,8 @@ def _ladder_step(coin, pos, mark):
         return
 
     avg    = float(trade["avg_entry"])
-    cur_sl = float(trade["ladder_sl"])
+    cur_sl = trade.get("ladder_sl")
+    cur_sl = float(cur_sl) if cur_sl is not None else None
     books  = int(trade.get("ladder_books", 0))
     orig   = float(trade.get("ladder_orig_qty", qty_abs))
     close_side = "sell" if side == "buy" else "buy"
@@ -1846,7 +1865,7 @@ def _ladder_step(coin, pos, mark):
     # ── 3. BREACH CHECK FIRST (committed stop) ────────────
     if _sl_breached(side, mark, cur_sl):
         reason = "server_sl" if books == 0 else "server_trail_sl"
-        log.warning(f"🛡️ LADDER STOP: {coin} {side.upper()} mark={mark} hit SL={cur_sl:.8f} "
+        log.warning(f"🛡️ LADDER STOP: {coin} {side.upper()} mark={mark} hit SL={_fmt_px(cur_sl)} "
                     f"(books={books}) — flatten {close_side.upper()} {qty_abs}")
         ok, used = _ladder_close(coin, close_side, qty_abs, mark, lev, reason)
         if not ok:
@@ -1854,9 +1873,31 @@ def _ladder_step(coin, pos, mark):
         record_realized(coin, avg, mark, used, side)
         clear_active_trade(coin, f"ladder stop (books={books})")
         log_trade_event(coin, close_side, reason, "FILLED",
-                        f"mark={mark} sl={cur_sl:.8f} books={books}")
+                        f"mark={mark} sl={_fmt_px(cur_sl)} books={books}")
         _server_exit_closes += 1
         log.info(f"🛡️ LADDER closed {coin} (total ladder closes: {_server_exit_closes})")
+        return
+
+    # ── 4a. SINGLE TAKE-PROFIT — close everything, no books / trail ──
+    if EXIT_MODE != "ladder":
+        if TP_PCT <= 0:
+            return
+        prof = ((mark - avg) / avg if side == "buy" else (avg - mark) / avg) * 100.0
+        if LADDER_VERBOSE:
+            log.info(f"🎯 tp[{coin}] {side} mark={mark} avg={avg} prof={prof:+.2f}% "
+                     f"roe≈{prof*float(lev):+.1f}% / TP {TP_PCT}% sl={_fmt_px(cur_sl)}")
+        if prof >= TP_PCT:
+            log.info(f"🎯 TAKE PROFIT: {coin} {side.upper()} +{prof:.2f}% ≥ {TP_PCT}% "
+                     f"(mark={mark} avg={avg}) — close {close_side.upper()} {qty_abs}")
+            ok, used = _ladder_close(coin, close_side, qty_abs, mark, lev, "server_tp")
+            if not ok:
+                return  # keep tracker, retry next poll — never orphan
+            record_realized(coin, avg, mark, used, side)
+            clear_active_trade(coin, f"take profit +{prof:.2f}%")
+            log_trade_event(coin, close_side, "server_tp", "FILLED",
+                            f"mark={mark} avg={avg} prof={prof:+.2f}%")
+            _server_exit_closes += 1
+            log.info(f"🎯 TP closed {coin} (total server closes: {_server_exit_closes})")
         return
 
     # ── 4. ADVANCE — books at rungs, then ratchet trail ───
@@ -1865,7 +1906,7 @@ def _ladder_step(coin, pos, mark):
         prof = ((mark - avg) / avg if side == "buy" else (avg - mark) / avg) * 100.0
         log.info(f"🪜 ladder[{coin}] {side} mark={mark} avg={avg} "
                  f"prof={prof:+.2f}% roe≈{prof*float(lev):+.1f}% k={k} "
-                 f"books={books}/{MAX_BOOKS} sl={cur_sl:.8f}")
+                 f"books={books}/{MAX_BOOKS} sl={_fmt_px(cur_sl)}")
     target_books = min(MAX_BOOKS, k)
     remaining  = qty_abs
     booked_any = False
@@ -1894,7 +1935,7 @@ def _ladder_step(coin, pos, mark):
         trade["ladder_books"] = books
         trade["qty"] = remaining            # keep tracked qty sane for /status
     if new_sl != cur_sl:
-        log.info(f"🪜 LADDER trail: {coin} SL {cur_sl:.8f} → {new_sl:.8f} "
+        log.info(f"🪜 LADDER trail: {coin} SL {_fmt_px(cur_sl)} → {_fmt_px(new_sl)} "
                  f"(rungs={k}, books={books})")
         trade["ladder_sl"] = new_sl
     if booked_any or new_sl != cur_sl:
@@ -2021,10 +2062,16 @@ def server_exit_worker():
     residual. Adding a lock would mean wrapping process_signal + reconciler +
     every closer — a large, risky change divergent from how this file is built."""
     global _server_exit_last_check_at, _server_exit_last_error
-    log.info(f"🪜 Server-exit (full ladder) started — enabled={SERVER_EXITS_ENABLED}, "
-             f"mode={'paper' if PAPER_MODE else 'live'}, "
-             f"SL={SL_PCT}% TP_STEP={TP_STEP_PCT}% BOOK={BOOK_PCT}%×{MAX_BOOKS} "
-             f"poll={EXIT_POLL_SEC}s")
+    if EXIT_MODE != "ladder":
+        log.info(f"🎯 Server-exit (SINGLE TP) started — enabled={SERVER_EXITS_ENABLED}, "
+                 f"mode={'paper' if PAPER_MODE else 'live'}, TP={TP_PCT}% price "
+                 f"(no books, no trail) SL={SL_PCT}% {'(OFF)' if SL_PCT <= 0 else '(fixed)'} "
+                 f"poll={EXIT_POLL_SEC}s")
+    else:
+        log.info(f"🪜 Server-exit (full ladder) started — enabled={SERVER_EXITS_ENABLED}, "
+                 f"mode={'paper' if PAPER_MODE else 'live'}, "
+                 f"SL={SL_PCT}% TP_STEP={TP_STEP_PCT}% BOOK={BOOK_PCT}%×{MAX_BOOKS} "
+                 f"poll={EXIT_POLL_SEC}s")
     while True:
         try:
             time.sleep(EXIT_POLL_SEC)
@@ -2666,7 +2713,9 @@ def status():
         },
         "server_exits": {
             "enabled": SERVER_EXITS_ENABLED,
-            "phase": "full_ladder",
+            "phase": "full_ladder" if EXIT_MODE == "ladder" else "single_tp",
+            "exit_mode": EXIT_MODE,
+            "tp_pct": TP_PCT,
             "mark_source": "all_mids",
             "mode": "paper" if PAPER_MODE else "live",
             "verbose": LADDER_VERBOSE,
@@ -3464,8 +3513,8 @@ log.info(f"⏱ Max-hold initialized — enabled={MAX_HOLD_ENABLED}, "
 
 threading.Thread(target=server_exit_worker, daemon=True).start()
 log.info(f"🪜 Server-exit initialized — enabled={SERVER_EXITS_ENABLED}, "
-         f"mode={'paper' if PAPER_MODE else 'live'}, SL={SL_PCT}%, "
-         f"TP_STEP={TP_STEP_PCT}%, BOOK={BOOK_PCT}%×{MAX_BOOKS}, poll={EXIT_POLL_SEC}s")
+         f"mode={'paper' if PAPER_MODE else 'live'}, exit_mode={EXIT_MODE} TP={TP_PCT}%, "
+         f"SL={SL_PCT}%, TP_STEP={TP_STEP_PCT}%, BOOK={BOOK_PCT}%×{MAX_BOOKS}, poll={EXIT_POLL_SEC}s")
 # Pine-flip on opposite-direction entry is coupled to SERVER_EXITS_ENABLED (see
 # the entry handler). Log it so the build is confirmable from the boot line.
 log.info(f"🔄 Pine-flip on opposite entry: {'ON' if SERVER_EXITS_ENABLED else 'OFF'} "
